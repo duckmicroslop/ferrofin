@@ -118,6 +118,10 @@ helm install ferrofin oci://ghcr.io/mangoleaf/ferrofin/charts/ferrofin -n ferrof
 See [`charts/ferrofin/README.md`](charts/ferrofin/README.md) and
 [`values.example.yaml`](charts/ferrofin/values.example.yaml) for a worked configuration.
 
+**Bare metal under systemd** (release binary + jellyfin-ffmpeg and jellyfin-web from
+Jellyfin's apt repository): follow [`docs/INSTALL.md`](docs/INSTALL.md); an example unit is
+in [`contrib/systemd/ferrofin.service`](contrib/systemd/ferrofin.service).
+
 **From source** (needs the pinned Rust toolchain; ffmpeg is optional and its absence only
 disables transcoding):
 

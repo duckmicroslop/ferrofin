@@ -1,0 +1,59 @@
+# Ferrofin media server — example systemd unit for a bare-metal install.
+#
+# Assumes the layout described in docs/INSTALL.md:
+#   /opt/ferrofin/current/ferrofin-server   the release binary (a symlink to a versioned dir)
+#   /etc/ferrofin/config.toml               configuration (docs/CONFIG.md)
+#   /var/lib/ferrofin/data                  data dir: jellyfin.db, cache/, log/, plugins/
+#   /usr/lib/jellyfin-ffmpeg/               jellyfin-ffmpeg from the Jellyfin apt repository
+#   /usr/share/jellyfin/web                 the jellyfin-web package's built client
+#
+# Install: cp contrib/systemd/ferrofin.service /etc/systemd/system/
+#          systemctl daemon-reload && systemctl enable --now ferrofin
+
+[Unit]
+Description=Ferrofin media server
+Documentation=https://github.com/mangoleaf/ferrofin
+Wants=network-online.target
+After=network-online.target remote-fs.target
+RequiresMountsFor=/var/lib/ferrofin/data
+
+[Service]
+Type=simple
+User=ferrofin
+Group=ferrofin
+WorkingDirectory=/var/lib/ferrofin/data
+
+# Fail fast, with a clear journal line, when a runtime dependency is missing.
+ExecStartPre=/usr/bin/test -x /usr/lib/jellyfin-ffmpeg/ffmpeg
+ExecStartPre=/usr/bin/test -x /usr/lib/jellyfin-ffmpeg/ffprobe
+ExecStartPre=/usr/bin/test -r /usr/share/jellyfin/web/index.html
+
+# systemd's PATH does not include /usr/lib/jellyfin-ffmpeg, so name the
+# binaries explicitly rather than letting discovery find Debian's /usr/bin/ffmpeg.
+# Everything here can live in config.toml instead; the environment wins.
+Environment=FERROFIN_FFMPEG_PATH=/usr/lib/jellyfin-ffmpeg/ffmpeg
+Environment=FERROFIN_FFPROBE_PATH=/usr/lib/jellyfin-ffmpeg/ffprobe
+Environment=FERROFIN_WEB_DIR=/usr/share/jellyfin/web
+ExecStart=/opt/ferrofin/current/ferrofin-server --config /etc/ferrofin/config.toml
+
+Restart=on-failure
+RestartSec=5
+# In-flight transcodes are killed on stop; the DB checkpoint is quick.
+TimeoutStopSec=45
+
+# Hardening. ProtectSystem=strict makes the whole filesystem read-only except
+# the paths listed; media libraries are read through the read-only view, which
+# is all a scan and a transcode need. Add a ReadWritePaths= entry for any
+# library where you enable deletion or metadata/image saving from the UI.
+UMask=0027
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/ferrofin/data
+# Hardware transcoding needs the render node; uncomment for VAAPI/QSV.
+#DeviceAllow=/dev/dri/renderD128 rw
+#SupplementaryGroups=render video
+
+[Install]
+WantedBy=multi-user.target
