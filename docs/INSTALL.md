@@ -96,10 +96,22 @@ For VAAPI/QSV hardware transcoding uncomment the `DeviceAllow=` and
 
 ## 5. Migrating a Jellyfin database
 
-Stop Jellyfin, then copy its `data/jellyfin.db` to `/var/lib/ferrofin/data/jellyfin.db`
-(Ferrofin also finds it at `data/jellyfin.db` under the data dir, so copying Jellyfin's
-whole data directory works too). Ferrofin adopts a **Jellyfin 10.11.8 through 10.11.11**
-database on first boot, writing `jellyfin.db.pre-ferrofin` beside it first. The adoption is one-way; going back to Jellyfin
+Stop Jellyfin, then copy three things from its data directory (`/var/lib/jellyfin` on a
+Debian install, the `/config` volume in Docker) into `/var/lib/ferrofin/data`:
+
+```sh
+sudo cp -a /var/lib/jellyfin/data/jellyfin.db /var/lib/ferrofin/data/jellyfin.db
+sudo cp -a /var/lib/jellyfin/root            /var/lib/ferrofin/data/   # library definitions
+sudo cp -a /var/lib/jellyfin/metadata        /var/lib/ferrofin/data/   # images, NFO cache
+sudo chown -R ferrofin:ferrofin /var/lib/ferrofin/data
+```
+
+The database holds the items, users and watch state. The library definitions are folders
+under `root/default/`, one per library with its `.mblink` path shortcuts and `options.xml`
+(imported into Ferrofin's `options.json` on first read); without them the admin Libraries
+page is empty. The images live under `metadata/`; without them every poster is a blurhash
+placeholder. Ferrofin adopts a **Jellyfin 10.11.8 through 10.11.11** database on first
+boot, writing `jellyfin.db.pre-ferrofin` beside it first. The adoption is one-way; going back to Jellyfin
 means restoring that copy. [`docs/UPGRADING.md`](UPGRADING.md) has the full notes.
 
 A database from any other Jellyfin version is refused with a message naming the unexpected

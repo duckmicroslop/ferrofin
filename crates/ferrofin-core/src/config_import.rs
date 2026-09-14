@@ -98,7 +98,23 @@ const MAX_DEPTH: usize = 64;
 /// A single-entry collection is otherwise indistinguishable from a nested
 /// object with one field, so these names break the tie.
 const COLLECTION_ITEM_NAMES: &[&str] = &[
-    "string", "int", "long", "short", "double", "float", "decimal", "boolean", "dateTime", "guid",
+    "string",
+    "int",
+    "long",
+    "short",
+    "double",
+    "float",
+    "decimal",
+    "boolean",
+    "dateTime",
+    "guid",
+    // `XmlSerializer` names a class-typed list entry after its class, so a
+    // one-entry `<PathInfos><MediaPathInfo>…` (a library with a single path —
+    // the common case) is indistinguishable from a nested object without
+    // these. They are the entry classes of a per-library `options.xml`.
+    "MediaPathInfo",
+    "TypeOptions",
+    "ImageOption",
 ];
 
 /// How an element with no Ferrofin default to take its shape from is read.
@@ -472,6 +488,29 @@ fn backend(action: &str, err: &serde_json::Error) -> ServiceError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn single_class_typed_entry_is_read_as_a_list() {
+        // A library with one path: `<PathInfos>` has exactly one
+        // `<MediaPathInfo>` child, which must come back as a one-element list,
+        // not an object keyed by the entry's class name.
+        #[derive(Debug, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+        #[serde(rename_all = "PascalCase", default)]
+        struct Opts {
+            path_infos: Vec<ferrofin_model::configuration::MediaPathInfo>,
+        }
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<Opts xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <PathInfos>
+    <MediaPathInfo>
+      <Path>/srv/media/shows</Path>
+    </MediaPathInfo>
+  </PathInfos>
+</Opts>"#;
+        let opts = super::import_over(&Opts::default(), xml, "Opts", &[]).expect("import");
+        assert_eq!(opts.path_infos.len(), 1);
+        assert_eq!(opts.path_infos[0].path, "/srv/media/shows");
+    }
+
     use super::*;
     use crate::configuration_manager::default_server_configuration;
     use ferrofin_model::configuration::{EncodingOptions, ServerConfiguration};

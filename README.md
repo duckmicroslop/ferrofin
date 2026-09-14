@@ -165,6 +165,13 @@ schema is the 10.11.8 shape either way.
 >    and `-shm` files if present, and the metadata/config folders).
 > 3. Start Ferrofin against a copy, not the original, until you are satisfied.
 >
+> Bring **three** things across, not just the database. `jellyfin.db` holds the items,
+> users and watch state; the **library definitions** are the folders under `root/default/`
+> (one per library, holding the `.mblink` path shortcuts and `options.xml`, which Ferrofin
+> imports into its own `options.json` on first read), and the **images** are the files
+> under `metadata/`. With only the database copied the libraries are still browsable but
+> the admin Libraries page is empty and every poster shows its blurhash placeholder.
+>
 > If you decide to go back to Jellyfin, restore that backup. Anything that happened in
 > Ferrofin after the switch (watch state, new users, playlists) stays in Ferrofin.
 
