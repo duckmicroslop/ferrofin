@@ -352,9 +352,14 @@ pub async fn build_app_state(
         .ensure()
         .await
         .context("failed to provision the aggregate root folder")?;
+    // Adopted Jellyfin rows store the metadata/data directories as
+    // `%MetadataPath%`/`%AppDataPath%`; every reader of image paths expands
+    // them against this server's directories (`BaseItemRepository.Map`).
+    let virtual_paths = ferrofin_core::virtual_paths::VirtualPathExpander::from_paths(&*paths);
     let item_repository: Arc<dyn ferrofin_traits::persistence::ItemRepository> = Arc::new(
         FerrofinItemRepository::new(db.clone(), Arc::clone(&item_type_lookup))
-            .with_root_ids(root_folder_ids),
+            .with_root_ids(root_folder_ids)
+            .with_virtual_paths(virtual_paths.clone()),
     );
     let item_count_service: Arc<dyn ferrofin_traits::persistence::ItemCountService> =
         Arc::new(FerrofinItemCountService::new(db.clone()).with_root_ids(root_folder_ids));
@@ -1465,7 +1470,8 @@ pub async fn build_app_state(
         )
         // The music "Links" row points at the configured MusicBrainz mirror, as
         // Jellyfin's link providers use the plugin's configured server.
-        .with_musicbrainz_server(&config.musicbrainz_base_url),
+        .with_musicbrainz_server(&config.musicbrainz_base_url)
+        .with_virtual_paths(virtual_paths),
     );
     // `DtoService` finishes a Live TV channel's DTO itself (C#
     // `DtoService.LivetvManager.AddChannelInfo`), so it needs the Live TV

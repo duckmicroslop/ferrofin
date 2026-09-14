@@ -57,6 +57,8 @@ use std::sync::{Arc, OnceLock};
 use async_trait::async_trait;
 use ferrofin_db::Database;
 use ferrofin_db::entities::base_items::{BaseItemEntity, BaseItemImageInfoEntity};
+
+use crate::virtual_paths::VirtualPathExpander;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_db::store::guid_to_db;
 use ferrofin_model::data::{BaseItemKind, CollectionType, MediaType};
@@ -308,9 +310,12 @@ fn image_type_from_disc(disc: i32) -> ImageType {
 
 /// Maps a stored `BaseItemImageInfos` row onto the in-flight [`ItemImageInfo`]
 /// the image processor and tag helpers consume.
-fn to_image_info(row: &BaseItemImageInfoEntity) -> ItemImageInfo {
+fn to_image_info(
+    row: &BaseItemImageInfoEntity,
+    virtual_paths: &VirtualPathExpander,
+) -> ItemImageInfo {
     ItemImageInfo {
-        path: row.path.clone(),
+        path: virtual_paths.expand(&row.path),
         image_type: image_type_from_disc(row.image_type),
         date_modified: row.date_modified.unwrap_or_default(),
         width: i32::try_from(row.width).unwrap_or(0),
@@ -1061,6 +1066,9 @@ pub struct FerrofinDtoService {
     media_sources: Arc<dyn MediaSourceManager>,
     chapters: Arc<dyn ChapterManager>,
     trickplay: Arc<dyn TrickplayManager>,
+    /// Expands `%MetadataPath%`/`%AppDataPath%` in adopted image rows (see
+    /// [`FerrofinDtoService::with_virtual_paths`]).
+    virtual_paths: VirtualPathExpander,
     /// The MusicBrainz root the "Links" row points music items at — the
     /// configured mirror, as C# uses `Plugin.Instance.Configuration.Server`.
     musicbrainz_server: String,
@@ -1111,6 +1119,7 @@ impl FerrofinDtoService {
             media_sources,
             chapters,
             trickplay,
+            virtual_paths: VirtualPathExpander::identity(),
             musicbrainz_server: ferrofin_providers::musicbrainz::DEFAULT_BASE_URL.to_owned(),
             live_tv: Arc::new(OnceLock::new()),
         }
@@ -1123,6 +1132,15 @@ impl FerrofinDtoService {
     /// `ChannelNumber`, no `ChannelType`, no `CurrentProgram`.
     pub fn set_live_tv(&self, live_tv: Arc<dyn ferrofin_traits::stubs::LiveTvManager>) {
         let _ = self.live_tv.set(live_tv);
+    }
+
+    /// Installs the server's [`VirtualPathExpander`], so the image rows this
+    /// service reads for tags, blurhashes and sizes resolve the same files the
+    /// image endpoints serve. Called once by the composition root.
+    #[must_use]
+    pub fn with_virtual_paths(mut self, virtual_paths: VirtualPathExpander) -> Self {
+        self.virtual_paths = virtual_paths;
+        self
     }
 
     /// Points the music "Links" row at a configured MusicBrainz mirror. Empty
@@ -1148,7 +1166,10 @@ impl FerrofinDtoService {
         .await
         .map_err(db_err)?;
 
-        Ok(rows.iter().map(to_image_info).collect())
+        Ok(rows
+            .iter()
+            .map(|row| to_image_info(row, &self.virtual_paths))
+            .collect())
     }
 
     /// Batch form of [`Self::load_images`]: all image rows for `item_ids` in one
@@ -1178,7 +1199,9 @@ impl FerrofinDtoService {
             let rows = query.fetch_all(self.db.pool()).await.map_err(db_err)?;
             for row in &rows {
                 if let Ok(item_id) = Uuid::parse_str(&row.item_id) {
-                    map.entry(item_id).or_default().push(to_image_info(row));
+                    map.entry(item_id)
+                        .or_default()
+                        .push(to_image_info(row, &self.virtual_paths));
                 }
             }
         }
