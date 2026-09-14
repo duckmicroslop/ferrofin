@@ -136,18 +136,14 @@ impl Database {
         //     per-migration transactions (SQLite's own recommended table-
         //     rebuild procedure). A `foreign_key_check` afterwards surfaces any
         //     integrity violation the rebuild introduced — see
-        //     [`foreign_key_check`] for why it runs only on a boot that
-        //     actually applied something.
+        //     [`foreign_key_check`] for why it runs on EVERY boot.
         if let Some(path) = &file_path {
             use sqlx::ConnectOptions;
             let mut conn = write_options.clone().foreign_keys(false).connect().await?;
             adopt_jellyfin_database(&mut conn, path).await?;
             backup_before_rebuild(&mut conn, path).await?;
-            let before = applied_migration_count(&mut conn).await?;
             MIGRATOR.run(&mut conn).await?;
-            if applied_migration_count(&mut conn).await? != before {
-                foreign_key_check(&mut conn).await?;
-            }
+            foreign_key_check(&mut conn).await?;
             sqlx::Connection::close(conn).await?;
         }
         Self::connect_with(read_options, write_options, pool_size, file_path).await
@@ -943,13 +939,20 @@ async fn adopt_jellyfin_database(
     Ok(())
 }
 
-/// Snapshots the database file before migration `0007` first applies.
+/// The migrations that rebuild Jellyfin-owned tables (the 12-step SQLite
+/// table-rebuild dance): `0007` (10.11.8 shape) and `0030` (12.0 shape). Each
+/// gets a file snapshot before it first applies — see [`backup_before_rebuild`].
+const REBUILD_MIGRATIONS: &[i64] = &[7, 30];
+
+/// Snapshots the database file before a table-rebuilding migration first
+/// applies.
 ///
-/// `0007` rebuilds `BaseItems`/`Users` (the 12-step SQLite table-rebuild
-/// dance) — the riskiest migration shipped so far — so an existing
-/// file-backed database gets copied aside once (`<db>.pre-0007`) before it
-/// runs. Fresh databases (no `_sqlx_migrations` yet) and databases already at
-/// or past 0007 are left alone.
+/// A rebuild drops and recreates `BaseItems`/`Users`/… — the riskiest thing a
+/// migration does (one such rebuild once cascade-deleted every user's data,
+/// `cbc983f`) — so an existing file-backed database is copied aside once
+/// (`<db>.pre-00NN`, for the highest [`REBUILD_MIGRATIONS`] entry not yet
+/// recorded) before it runs. Fresh databases (no `_sqlx_migrations` yet) and
+/// databases already past every rebuild are left alone.
 async fn backup_before_rebuild(
     conn: &mut sqlx::SqliteConnection,
     path: &std::path::Path,
@@ -962,36 +965,45 @@ async fn backup_before_rebuild(
     if has_history.is_none() {
         return Ok(()); // fresh database — nothing worth snapshotting
     }
-    let applied_0007: Option<i64> =
-        sqlx::query_scalar("SELECT 1 FROM \"_sqlx_migrations\" WHERE version = 7")
-            .fetch_optional(&mut *conn)
-            .await?;
-    if applied_0007.is_some() {
-        return Ok(());
+    // Name the snapshot after the FIRST rebuild that will run: that is the
+    // file as it was before any rebuild touched it, which is the one to
+    // restore from.
+    let mut pending: Option<i64> = None;
+    for &version in REBUILD_MIGRATIONS {
+        let applied: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM \"_sqlx_migrations\" WHERE version = ?1")
+                .bind(version)
+                .fetch_optional(&mut *conn)
+                .await?;
+        if applied.is_none() {
+            pending = Some(version);
+            break;
+        }
     }
+    let Some(version) = pending else {
+        return Ok(());
+    };
     // Fold the WAL into the main file so a plain file copy is a complete,
     // consistent snapshot (startup: no other writers yet).
     sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
         .execute(&mut *conn)
         .await?;
-    let backup = path.with_extension("db.pre-0007");
+    let backup = path.with_extension(format!("db.pre-{version:04}"));
     std::fs::copy(path, &backup).map_err(|source| crate::DbError::Backup {
         path: backup.display().to_string(),
         source,
     })?;
     tracing::info!(
         backup = %backup.display(),
-        "database snapshot taken before the 0007 schema-rebuild migration"
+        migration = version,
+        "database snapshot taken before a schema-rebuild migration"
     );
     Ok(())
 }
 
 /// How many migrations `_sqlx_migrations` records as applied (`0` when the
 /// table does not exist yet — a fresh or Jellyfin-native database).
-///
-/// Used to tell "this boot applied something" from "this boot was a no-op
-/// history check", which is what gates the post-migration
-/// [`foreign_key_check`].
+#[cfg(test)]
 async fn applied_migration_count(conn: &mut sqlx::SqliteConnection) -> Result<i64> {
     let has_history: Option<i64> = sqlx::query_scalar(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
@@ -1012,14 +1024,12 @@ async fn applied_migration_count(conn: &mut sqlx::SqliteConnection) -> Result<i6
 ///
 /// This is the seatbelt on the `foreign_keys = OFF` migration connection: a
 /// table-rebuild migration drops a parent table, and with enforcement off a
-/// mistake there leaves dangling child rows instead of erroring. The scan is
-/// **O(rows × foreign keys)** — ~20 ms on a 10k-item library, and it grows with
-/// the library — so it runs only on a boot that actually applied a migration.
-/// That is not a weakened guarantee: a boot whose `MIGRATOR.run` was a no-op
-/// changed no schema and can have introduced no violation, and the boot that
-/// *did* apply the migration already ran this check and refused to open if it
-/// failed. Every migration is therefore still verified, exactly once, on the
-/// boot that applies it.
+/// mistake there leaves dangling child rows instead of erroring. It runs on
+/// **every** file-backed boot, not only on one that applied a migration: a
+/// boot that failed the check must be followed by one that fails it again,
+/// and a marker written after the migration committed would have its own
+/// crash window. The scan is **O(rows × foreign keys)** — measured at 0.14 s
+/// on a real 42k-item, 250 MB library — noise against a cold start.
 async fn foreign_key_check(conn: &mut sqlx::SqliteConnection) -> Result<()> {
     let violations = sqlx::query("PRAGMA foreign_key_check")
         .fetch_all(&mut *conn)
@@ -1709,13 +1719,16 @@ mod tests {
             .connect()
             .await
             .expect("connect with enforcement off");
+        // `AccessSchedules`, not `Permissions`: 0030 ports 12.0's
+        // RemoveOrphanedUserPermissionsAndPreferences and would legitimately
+        // delete an orphaned permission row before the check ever saw it.
         sqlx::query(
-            r#"INSERT INTO "Permissions" ("Id","Kind","RowVersion","Value","UserId")
-               VALUES (99,0,0,1,'ffffffff-ffff-ffff-ffff-ffffffffffff')"#,
+            r#"INSERT INTO "AccessSchedules" ("Id","DayOfWeek","EndHour","StartHour","UserId")
+               VALUES (99,0,23.0,1.0,'ffffffff-ffff-ffff-ffff-ffffffffffff')"#,
         )
         .execute(&mut conn)
         .await
-        .expect("plant a permission whose user does not exist");
+        .expect("plant an access schedule whose user does not exist");
         sqlx::Connection::close(conn).await.expect("close");
 
         let err = Database::connect_sized(&url, Some(1))

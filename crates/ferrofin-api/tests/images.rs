@@ -160,7 +160,6 @@ fn empty_item() -> BaseItemEntity {
         name: None,
         normalization_gain: None,
         official_rating: None,
-        extra_ids: None,
         original_title: None,
         overview: None,
         owner_id: None,

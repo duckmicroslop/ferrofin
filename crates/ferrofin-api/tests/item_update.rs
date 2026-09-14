@@ -125,7 +125,6 @@ fn base_item_entity(id: Uuid) -> BaseItemEntity {
         name: Some("Test Item".to_owned()),
         normalization_gain: None,
         official_rating: None,
-        extra_ids: None,
         original_title: None,
         overview: None,
         owner_id: None,

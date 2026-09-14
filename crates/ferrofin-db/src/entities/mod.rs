@@ -68,10 +68,10 @@ mod tests {
                 "MaxActiveSessions", "MustUpdatePassword",
                 "PasswordResetProviderId", "PlayDefaultAudioTrack",
                 "RememberAudioSelections", "RememberSubtitleSelections", "RowVersion",
-                "SubtitleMode", "SyncPlayAccess", "Username"
+                "SubtitleMode", "SyncPlayAccess", "Username", "NormalizedUsername"
             ) VALUES (
                 ?1, 'auth', 0, 0, 0, 0, 0, 1, 0, 42, 0, 5, 0,
-                'reset', 1, 1, 1, 7, 1, 2, 'ada'
+                'reset', 1, 1, 1, 7, 1, 2, 'ada', 'ADA'
             )"#,
         )
         .bind(guid_to_db(id))
@@ -254,7 +254,6 @@ mod tests {
         assert_eq!(permission.kind, 4);
         assert!(permission.value);
         assert_eq!(permission.user_id, Some(guid_to_db(user_id)));
-        assert_eq!(permission.permission_guid, None);
 
         let preference: PreferenceEntity =
             sqlx::query_as(r#"SELECT * FROM "Preferences" WHERE "Id" = 1"#)

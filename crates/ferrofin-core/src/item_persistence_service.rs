@@ -800,7 +800,6 @@ impl FerrofinItemPersistenceService {
             .bind(&item.name)
             .bind(item.normalization_gain)
             .bind(&item.official_rating)
-            .bind(&item.extra_ids)
             .bind(&item.original_title)
             .bind(&item.overview)
             .bind(&item.owner_id)
@@ -1597,7 +1596,7 @@ const UPSERT_SQL: &str = r#"INSERT INTO "BaseItems" (
     "InheritedParentalRatingSubValue", "InheritedParentalRatingValue", "IsFolder",
     "IsInMixedFolder", "IsLocked", "IsMovie", "IsRepeat", "IsSeries", "IsVirtualItem",
     "LUFS", "MediaType", "Name", "NormalizationGain", "OfficialRating",
-    "ExtraIds", "OriginalTitle", "Overview", "OwnerId", "ParentId",
+    "OriginalTitle", "Overview", "OwnerId", "ParentId",
     "ParentIndexNumber", "Path", "PreferredMetadataCountryCode",
     "PreferredMetadataLanguage", "PremiereDate", "PresentationUniqueKey",
     "PrimaryVersionId", "ProductionLocations", "ProductionYear", "RunTimeTicks",
@@ -1607,7 +1606,7 @@ const UPSERT_SQL: &str = r#"INSERT INTO "BaseItems" (
 ) VALUES (
     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 ) ON CONFLICT("Id") DO UPDATE SET
     "Album" = excluded."Album", "AlbumArtists" = excluded."AlbumArtists",
     "Artists" = excluded."Artists", "Audio" = excluded."Audio",
@@ -1630,7 +1629,7 @@ const UPSERT_SQL: &str = r#"INSERT INTO "BaseItems" (
     "IsVirtualItem" = excluded."IsVirtualItem", "LUFS" = excluded."LUFS",
     "MediaType" = excluded."MediaType", "Name" = excluded."Name",
     "NormalizationGain" = excluded."NormalizationGain", "OfficialRating" = excluded."OfficialRating",
-    "ExtraIds" = excluded."ExtraIds", "OriginalTitle" = excluded."OriginalTitle",
+    "OriginalTitle" = excluded."OriginalTitle",
     "Overview" = excluded."Overview", "OwnerId" = excluded."OwnerId",
     "ParentId" = excluded."ParentId", "ParentIndexNumber" = excluded."ParentIndexNumber",
     "Path" = excluded."Path",

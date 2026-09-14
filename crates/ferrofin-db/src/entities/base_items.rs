@@ -119,10 +119,6 @@ pub struct BaseItemEntity {
     pub normalization_gain: Option<f64>,
     /// The official rating (`OfficialRating`), if any.
     pub official_rating: Option<String>,
-    /// Pipe-delimited lowercase hyphenated GUIDs of this item's extras
-    /// (`ExtraIds`) — 10.11.8's extras linkage (C# `string.Join('|', …)` over
-    /// `Guid.ToString()`), kept in sync with `OwnerId` on the extras.
-    pub extra_ids: Option<String>,
     /// The original title (`OriginalTitle`), if any.
     pub original_title: Option<String>,
     /// The overview text (`Overview`), if any.

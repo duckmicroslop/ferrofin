@@ -1,11 +1,11 @@
 //! Schema-equality gate: a fresh Ferrofin database's Jellyfin-owned schema must
-//! be IDENTICAL to a real Jellyfin 10.11.8 database's.
+//! be IDENTICAL to a real Jellyfin 12.0 database's.
 //!
-//! The fixture (`tests/data/jellyfin-10.11.8-schema.sql`) is the sqlite_master
-//! dump of a database created by a real `jellyfin/jellyfin:10.11.8` server —
+//! The fixture (`tests/data/jellyfin-12.0-schema.sql`) is the sqlite_master
+//! dump of the owner's real library after one `jellyfin/jellyfin:12.0` boot (the realistic adoption case; a fresh 12.0 install differs only by lacking `IX_CustomItemDisplayPreferences_UserId`) —
 //! the drop-in contract. This
 //! test is the tripwire for future drift: any schema change that breaks
-//! byte-parity with 10.11.8 fails here, and the future Jellyfin-12 sync will
+//! byte-parity with 12.0 fails here, and the next Jellyfin generation will
 //! be gated on an updated fixture the same way.
 //!
 //! Comparison rules:
@@ -111,10 +111,10 @@ async fn snapshot(pool: &SqlitePool) -> (BTreeMap<String, TableShape>, BTreeSet<
 }
 
 #[tokio::test]
-async fn fresh_ferrofin_schema_equals_real_jellyfin_10_11_8() {
-    // The real 10.11.8 schema, from the committed fixture dump.
+async fn fresh_ferrofin_schema_equals_real_jellyfin_12_0() {
+    // The real 12.0 schema, from the committed fixture dump.
     let jellyfin = Database::connect_in_memory().await.expect("jf connect");
-    sqlx::raw_sql(include_str!("data/jellyfin-10.11.8-schema.sql"))
+    sqlx::raw_sql(include_str!("data/jellyfin-12.0-schema.sql"))
         .execute(jellyfin.pool())
         .await
         .expect("apply fixture schema");
@@ -139,18 +139,18 @@ async fn fresh_ferrofin_schema_equals_real_jellyfin_10_11_8() {
         let hm_shape = &hm_tables[name];
         assert_eq!(
             jf_shape.columns, hm_shape.columns,
-            "column shape of `{name}` diverges from 10.11.8"
+            "column shape of `{name}` diverges from 12.0"
         );
         assert_eq!(
             jf_shape.foreign_keys, hm_shape.foreign_keys,
-            "foreign keys of `{name}` diverge from 10.11.8"
+            "foreign keys of `{name}` diverge from 12.0"
         );
     }
 
     let missing: Vec<_> = jf_indexes.difference(&hm_indexes).collect();
     assert!(
         missing.is_empty(),
-        "10.11.8 indexes missing from Ferrofin: {missing:?}"
+        "12.0 indexes missing from Ferrofin: {missing:?}"
     );
     let extra: Vec<_> = hm_indexes
         .difference(&jf_indexes)

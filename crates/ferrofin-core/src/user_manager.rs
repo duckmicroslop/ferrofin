@@ -404,14 +404,17 @@ impl FerrofinUserManager {
                 "MaxActiveSessions", "MustUpdatePassword",
                 "PasswordResetProviderId", "PlayDefaultAudioTrack",
                 "RememberAudioSelections", "RememberSubtitleSelections",
-                "RowVersion", "SubtitleMode", "SyncPlayAccess", "Username")
-               VALUES (?1, ?2, 0, 0, 0, 0, 1, 1, 1, 'F007D354', ?3, 0, 0, 0, ?4, 1, 1, 1, 0, 0, 0, ?5)"#,
+                "RowVersion", "SubtitleMode", "SyncPlayAccess", "Username", "NormalizedUsername")
+               VALUES (?1, ?2, 0, 0, 0, 0, 1, 1, 1, 'F007D354', ?3, 0, 0, 0, ?4, 1, 1, 1, 0, 0, 0, ?5, ?6)"#,
         )
         .bind(&id_str)
         .bind(DEFAULT_AUTH_PROVIDER_ID)
         .bind(internal_id)
         .bind(DEFAULT_PASSWORD_RESET_PROVIDER_ID)
         .bind(name)
+        // 12.0's `UpdateNormalizedUsername`: `ToUpperInvariant()` — Rust's
+        // Unicode uppercase, not SQL `upper()`, which is ASCII-only.
+        .bind(name.to_uppercase())
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -571,12 +574,15 @@ impl UserManager for FerrofinUserManager {
         if Self::fetch_user_on(&mut *tx, user_id).await?.is_none() {
             return Err(ServiceError::not_found(format!("user {user_id}")));
         }
-        sqlx::query(r#"UPDATE "Users" SET "Username" = ?2 WHERE "Id" = ?1"#)
-            .bind(guid_to_db(user_id))
-            .bind(new_name)
-            .execute(&mut *tx)
-            .await
-            .map_err(db_err)?;
+        sqlx::query(
+            r#"UPDATE "Users" SET "Username" = ?2, "NormalizedUsername" = ?3 WHERE "Id" = ?1"#,
+        )
+        .bind(guid_to_db(user_id))
+        .bind(new_name)
+        .bind(new_name.to_uppercase())
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
         self.auth_cache.clear();
         Ok(())

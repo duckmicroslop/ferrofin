@@ -74,7 +74,6 @@ fn item(id: Uuid, kind: BaseItemKind, name: &str) -> BaseItemEntity {
         name: Some(name.to_owned()),
         normalization_gain: None,
         official_rating: None,
-        extra_ids: None,
         original_title: None,
         overview: None,
         owner_id: None,
@@ -654,8 +653,8 @@ async fn user_data_sorts_order_by_play_state() {
             "MaxActiveSessions", "MustUpdatePassword",
             "PasswordResetProviderId", "PlayDefaultAudioTrack",
             "RememberAudioSelections", "RememberSubtitleSelections",
-            "RowVersion", "SubtitleMode", "SyncPlayAccess", "Username")
-           VALUES (?1, '', 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, '', 1, 1, 1, 0, 0, 0, 'bob')"#,
+            "RowVersion", "SubtitleMode", "SyncPlayAccess", "Username", "NormalizedUsername")
+           VALUES (?1, '', 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, '', 1, 1, 1, 0, 0, 0, 'bob', 'BOB')"#,
     )
     .bind(user_id.to_string().to_uppercase())
     .execute(db.writer())
@@ -760,8 +759,8 @@ async fn paged_user_data_sort_with_total_count_works() {
             "MaxActiveSessions", "MustUpdatePassword",
             "PasswordResetProviderId", "PlayDefaultAudioTrack",
             "RememberAudioSelections", "RememberSubtitleSelections",
-            "RowVersion", "SubtitleMode", "SyncPlayAccess", "Username")
-           VALUES (?1, '', 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, '', 1, 1, 1, 0, 0, 0, 'bob')"#,
+            "RowVersion", "SubtitleMode", "SyncPlayAccess", "Username", "NormalizedUsername")
+           VALUES (?1, '', 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, '', 1, 1, 1, 0, 0, 0, 'bob', 'BOB')"#,
     )
     .bind(user_id.to_string().to_uppercase())
     .execute(db.writer())
@@ -1072,8 +1071,8 @@ async fn seed_user_who_sees_everything(
             "MaxActiveSessions", "MustUpdatePassword",
             "PasswordResetProviderId", "PlayDefaultAudioTrack",
             "RememberAudioSelections", "RememberSubtitleSelections",
-            "RowVersion", "SubtitleMode", "SyncPlayAccess", "Username")
-           VALUES (?1, '', 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, '', 1, 1, 1, 0, 0, 0, 'bob')"#,
+            "RowVersion", "SubtitleMode", "SyncPlayAccess", "Username", "NormalizedUsername")
+           VALUES (?1, '', 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, '', 1, 1, 1, 0, 0, 0, 'bob', 'BOB')"#,
     )
     .bind(key.clone())
     .execute(db.writer())
