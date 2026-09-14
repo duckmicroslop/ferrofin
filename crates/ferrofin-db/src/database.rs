@@ -704,6 +704,45 @@ impl Database {
         Ok(value)
     }
 
+    /// The adoption record, if this database was adopted from a Jellyfin
+    /// generation by a Ferrofin that wrote one (see [`AdoptionState`]).
+    ///
+    /// # Errors
+    /// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if the query fails.
+    pub async fn adoption_state(&self) -> Result<Option<AdoptionState>> {
+        let exists: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'FerrofinAdoption'",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        if exists.is_none() {
+            return Ok(None);
+        }
+        let row: Option<(String, i64)> = sqlx::query_as(
+            r#"SELECT "Generation", "MembershipImportDone" FROM "FerrofinAdoption" LIMIT 1"#,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(generation, done)| AdoptionState {
+            generation,
+            membership_import_done: done != 0,
+        }))
+    }
+
+    /// The writer-pool half of a membership import: marks the adoption
+    /// record's import as done. Callers run it inside the same transaction
+    /// as the imported rows via [`Self::writer`]; this convenience is for the
+    /// non-transactional case.
+    ///
+    /// # Errors
+    /// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if the write fails.
+    pub async fn mark_membership_import_done(&self) -> Result<()> {
+        sqlx::query(r#"UPDATE "FerrofinAdoption" SET "MembershipImportDone" = 1"#)
+            .execute(&self.writer)
+            .await?;
+        Ok(())
+    }
+
     /// The single-connection **writer** pool, for `INSERT`/`UPDATE`/`DELETE`
     /// (`.execute(...)`) and write transactions (`.begin()`).
     ///
@@ -752,8 +791,7 @@ impl Database {
 }
 
 /// The exact `__EFMigrationsHistory` migration-id set a Jellyfin 10.11.8
-/// server leaves behind (68 rows) — the only Jellyfin database
-/// generation Ferrofin adopts. Captured from a real `jellyfin/jellyfin:10.11.8`.
+/// server leaves behind (68 rows). Captured from a real `jellyfin/jellyfin:10.11.8`.
 const JELLYFIN_10_11_8_MIGRATIONS: [&str; 68] = [
     "20200514181226_AddActivityLog",
     "20200613202153_AddUsers",
@@ -825,25 +863,218 @@ const JELLYFIN_10_11_8_MIGRATIONS: [&str; 68] = [
     "20260206200000_FixLibrarySubtitleDownloadLanguages",
 ];
 
-/// Ferrofin migrations at or below this version define the Jellyfin-owned
-/// schema shape; an adopted Jellyfin database already HAS that shape, so they
-/// are baselined as applied-without-running. Everything above is
-/// Ferrofin-additive (and written to be a no-op on Jellyfin-formatted data).
-const JELLYFIN_SHAPE_MIGRATION_HEAD: i64 = 7;
+/// The exact `__EFMigrationsHistory` migration-id set a Jellyfin 12.0.0 server
+/// leaves behind (102 rows: the 68 above plus 12.0's 34). Captured from the
+/// fixture in `tests/data/jellyfin-12.0-schema.sql`'s source database after
+/// one `jellyfin/jellyfin:12.0` boot.
+const JELLYFIN_12_0_MIGRATIONS: [&str; 102] = [
+    "20200514181226_AddActivityLog",
+    "20200613202153_AddUsers",
+    "20200728005145_AddDisplayPreferences",
+    "20200905220533_FixDisplayPreferencesIndex",
+    "20201004171403_AddMaxActiveSessions",
+    "20201204223655_AddCustomDisplayPreferences",
+    "20210320181425_AddIndexesAndCollations",
+    "20210407110544_NullableCustomPrefValue",
+    "20210814002109_AddDevices",
+    "20221022080052_AddIndexActivityLogsDateCreated",
+    "20230526173516_RemoveEasyPassword",
+    "20230626233818_AddTrickplayInfos",
+    "20230923170422_UserCastReceiver",
+    "20240729140605_AddMediaSegments",
+    "20240928082930_MarkSegmentProviderIdNonNullable",
+    "20241020103111_LibraryDbMigration",
+    "20241111131257_AddedCustomDataKey",
+    "20241111135439_AddedCustomDataKeyKey",
+    "20241112152323_FixAncestorIdConfig",
+    "20241112232041_FixMediaStreams",
+    "20241112234144_FixMediaStreams2",
+    "20241113133548_EnforceUniqueItemValue",
+    "20250202021306_FixedCollation",
+    "20250204092455_MakeStartEndDateNullable",
+    "20250214031148_ChannelIdGuid",
+    "20250326065026_AddInheritedParentalRatingSubValue",
+    "20250327101120_AddKeyframeData",
+    "20250327171413_AddHdr10PlusFlag",
+    "20250331182844_FixAttachmentMigration",
+    "20250401142247_FixAncestors",
+    "20250405075612_FixItemValuesIndices",
+    "20250420000000_CreateNetworkConfiguration",
+    "20250420010000_MigrateNetworkConfiguration",
+    "20250420020000_MigrateMusicBrainzTimeout",
+    "20250420030000_MigrateEncodingOptions",
+    "20250420040000_RenameEnableGroupingIntoCollections",
+    "20250420050000_DisableTranscodingThrottling",
+    "20250420060000_CreateUserLoggingConfigFile",
+    "20250420070000_MigrateActivityLogDb",
+    "20250420080000_RemoveDuplicateExtras",
+    "20250420090000_AddDefaultPluginRepository",
+    "20250420100000_MigrateUserDb",
+    "20250420110000_ReaddDefaultPluginRepository",
+    "20250420120000_MigrateDisplayPreferencesDb",
+    "20250420130000_RemoveDownloadImagesInAdvance",
+    "20250420140000_MigrateAuthenticationDb",
+    "20250420150000_FixPlaylistOwner",
+    "20250420160000_AddDefaultCastReceivers",
+    "20250420170000_UpdateDefaultPluginRepository",
+    "20250420180000_FixAudioData",
+    "20250420190000_RemoveDuplicatePlaylistChildren",
+    "20250420193000_MigrateLibraryDbCompatibilityCheck",
+    "20250420200000_MigrateLibraryDb",
+    "20250420210000_MoveExtractedFiles",
+    "20250420220000_MigrateRatingLevels",
+    "20250420230000_MoveTrickplayFiles",
+    "20250420230000_RefreshInternalDateModified",
+    "20250421000000_MigrateKeyframeData",
+    "20250609115616_DetachUserDataInsteadOfDelete",
+    "20250618010000_MigrateLibraryUserData",
+    "20250620180000_FixDates",
+    "20250622170802_BaseItemImageInfoDateModifiedNullable",
+    "20250714044826_ResetJournalMode",
+    "20250730215000_ReseedFolderFlag",
+    "20250913211637_AddProperParentChildRelationBaseItemWithCascade",
+    "20250925203415_ExtendPeopleMapKey",
+    "20251009200000_CleanMusicArtist",
+    "20260113102337_AddLinkedChildrenTable",
+    "20260113120000_MigrateLinkedChildren",
+    "20260113203012_ChangeOwnerIdToGuid",
+    "20260113230000_CleanupOrphanedExtras",
+    "20260113233000_AddForeignKeyToOwnerId",
+    "20260113233500_DropExtraIdsColumn",
+    "20260115120000_FixIncorrectOwnerIdRelationships",
+    "20260116114245_AddLatestItemsDateCreatedIndexes",
+    "20260118182305_AddIndicesToImageInfo",
+    "20260130232147_AddBaseItemNameIndex",
+    "20260206200000_FixLibrarySubtitleDownloadLanguages",
+    "20260206224832_IndexOptimizations",
+    "20260215201634_ChangePrimaryVersionIdToGuid",
+    "20260302090000_MigrateRatingLevels",
+    "20260308123920_AddTypeCleanNameIndex",
+    "20260504075755_AddPartialIndexForItemCounts",
+    "20260508120000_MergeDuplicateMusicArtists",
+    "20260508130000_MergeDuplicatePeople",
+    "20260522092303_AddNormalizedUsername",
+    "20260522092304_UpdateNormalizedUsername",
+    "20260524120336_AddUniqueNormalizedUsernameIndex",
+    "20260525010000_CleanupOrphanedExternalData",
+    "20260531160000_DisableLegacyAuthorization",
+    "20260610120000_RefreshCleanNamesAndValues",
+    "20260722120000_RefreshForcedSortNames",
+    "20260723111547_AllowDuplicatePlaylistChildren",
+    "20260724185102_AddPrimaryVersionIdIndex",
+    "20260728170000_AddPeopleNameLowerIndex",
+    "20260728182152_AddPeopleItemMapCoveringIndex",
+    "20260729120000_RestorePlaylistChildrenFromMetadata",
+    "20260812050902_AddMediaStreamFilterIndex",
+    "20260815063607_RemoveOrphanedUserPermissionsAndPreferences",
+    "20260821120000_RecomputeSeriesPresentationKey",
+    "20260825200000_ConsolidateLocalizedUserViews",
+    "20260831100000_EnableLocalSimilarityProviders",
+];
 
-/// Adopts an existing Jellyfin 10.11.8 SQLite database in place, if `conn` is
-/// one — the drop-in path (exercised end-to-end by `suite/roundtrip.sh`).
+/// A Jellyfin schema generation Ferrofin adopts in place.
+///
+/// Adoption is gated on the **exact** `__EFMigrationsHistory` id set a real
+/// server of that release leaves behind — anything newer, older or partial is
+/// refused rather than half-adopted. `baselined_versions` are the Ferrofin
+/// migrations whose *shape* the database already has, recorded as applied
+/// without executing; every other migration runs.
+#[derive(Debug, Clone, Copy)]
+pub struct JellyfinGeneration {
+    /// The release name, as shown in logs and errors (`"10.11.8"`, `"12.0.0"`).
+    pub name: &'static str,
+    /// The sorted EF migration-id set of that release.
+    pub migration_ids: &'static [&'static str],
+    /// Ferrofin migrations baselined (recorded, never run) for that generation.
+    pub baselined_versions: &'static [i64],
+}
+
+/// The generations Ferrofin adopts. `0031` is never baselined: it is the
+/// Ferrofin-side convergence and must run on every path.
+pub const JELLYFIN_GENERATIONS: [JellyfinGeneration; 2] = [
+    JellyfinGeneration {
+        name: "10.11.8",
+        migration_ids: &JELLYFIN_10_11_8_MIGRATIONS,
+        baselined_versions: &[1, 2, 3, 4, 5, 6, 7],
+    },
+    JellyfinGeneration {
+        name: "12.0.0",
+        migration_ids: &JELLYFIN_12_0_MIGRATIONS,
+        baselined_versions: &[1, 2, 3, 4, 5, 6, 7, 30],
+    },
+];
+
+/// The generation whose id set equals `applied` (sorted), if any.
+fn match_generation(applied: &[String]) -> Option<&'static JellyfinGeneration> {
+    JELLYFIN_GENERATIONS.iter().find(|g| {
+        let mut ids = g.migration_ids.to_vec();
+        ids.sort_unstable();
+        applied.iter().map(String::as_str).eq(ids.iter().copied())
+    })
+}
+
+/// The refusal for an EF history that matches no generation, reported against
+/// the closest one so the message says what is actually off (one id short of
+/// 12.0 reads as "12.0 minus X", not as "34 unknown ids on top of 10.11.8").
+fn unsupported_generation(applied: &[String]) -> crate::DbError {
+    let (closest, missing, extra) = JELLYFIN_GENERATIONS
+        .iter()
+        .map(|g| {
+            let missing: Vec<&str> = g
+                .migration_ids
+                .iter()
+                .filter(|e| !applied.iter().any(|a| a == *e))
+                .copied()
+                .collect();
+            let extra: Vec<&str> = applied
+                .iter()
+                .filter(|a| !g.migration_ids.contains(&a.as_str()))
+                .map(String::as_str)
+                .collect();
+            (g, missing, extra)
+        })
+        .min_by_key(|(_, m, e)| m.len() + e.len())
+        .expect("at least one generation");
+    let accepted: Vec<&str> = JELLYFIN_GENERATIONS.iter().map(|g| g.name).collect();
+    crate::DbError::UnsupportedJellyfinDatabase {
+        reason: format!(
+            "its migration history matches no supported Jellyfin release \
+             ({} applied; closest is {} with {} expected — missing: {missing:?}; \
+             unknown: {extra:?}). Ferrofin adopts exactly these generations: {accepted:?} — \
+             bring the database to one of them first (or restore a backup)",
+            applied.len(),
+            closest.name,
+            closest.migration_ids.len(),
+        ),
+    }
+}
+
+/// Which Jellyfin generation a database was adopted from, and whether the
+/// one-shot membership import has run — the code-created `FerrofinAdoption`
+/// row written in the same transaction as the baseline. `None` for a
+/// Ferrofin-native database or one adopted before this bookkeeping existed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdoptionState {
+    /// The generation name (`"10.11.8"` / `"12.0.0"`).
+    pub generation: String,
+    /// Whether the playlist/collection membership import from `Data` JSON has run.
+    pub membership_import_done: bool,
+}
+
+/// Adopts an existing Jellyfin SQLite database in place, if `conn` is one —
+/// the drop-in path.
 ///
 /// Detection: an `__EFMigrationsHistory` table with no `_sqlx_migrations`
-/// alongside it. The applied EF migration-id set must match
-/// [`JELLYFIN_10_11_8_MIGRATIONS`] **exactly** — anything newer, older, or
-/// partial is refused loudly rather than half-adopted. On adoption the file
-/// is copied aside once (`<db>.pre-ferrofin`), Ferrofin's schema-shape migrations
-/// (`0001`–`0007`) are baselined into `_sqlx_migrations` without executing —
-/// the Jellyfin database already has that exact shape — and the caller's
-/// normal `MIGRATOR.run` then applies only the Ferrofin-additive tail.
-/// `__EFMigrationsHistory`/`__EFMigrationsLock` are never touched, so
-/// switching back to Jellyfin keeps working.
+/// alongside it. The applied EF migration-id set must match one
+/// [`JellyfinGeneration`] **exactly** — anything newer, older, or partial is
+/// refused loudly rather than half-adopted. On adoption the file is copied
+/// aside once (`<db>.pre-ferrofin`); then, in **one transaction**, that
+/// generation's `baselined_versions` are recorded in `_sqlx_migrations`
+/// without executing (the database already has their shape) and a
+/// `FerrofinAdoption` row is written — the durable "this database was newly
+/// adopted from generation X" fact the one-shot boot repairs key on. The
+/// caller's normal `MIGRATOR.run` then applies everything else.
+/// `__EFMigrationsHistory`/`__EFMigrationsLock` are never touched.
 async fn adopt_jellyfin_database(
     conn: &mut sqlx::SqliteConnection,
     path: &std::path::Path,
@@ -867,39 +1098,14 @@ async fn adopt_jellyfin_database(
         return Ok(());
     }
 
-    // Version gate: exactly the 10.11.8 set, or refuse (never half-adopt).
+    // Version gate: exactly one accepted generation, or refuse (never half-adopt).
     let applied: Vec<String> =
         sqlx::query_scalar(r#"SELECT "MigrationId" FROM "__EFMigrationsHistory" ORDER BY 1"#)
             .fetch_all(&mut *conn)
             .await?;
-    let mut expected: Vec<&str> = JELLYFIN_10_11_8_MIGRATIONS.to_vec();
-    expected.sort_unstable();
-    if applied
-        .iter()
-        .map(String::as_str)
-        .ne(expected.iter().copied())
-    {
-        let missing: Vec<&str> = expected
-            .iter()
-            .filter(|e| !applied.iter().any(|a| a == *e))
-            .copied()
-            .collect();
-        let extra: Vec<&str> = applied
-            .iter()
-            .filter(|a| !expected.contains(&a.as_str()))
-            .map(String::as_str)
-            .collect();
-        return Err(crate::DbError::UnsupportedJellyfinDatabase {
-            reason: format!(
-                "its migration history does not match Jellyfin 10.11.8 \
-                 ({} applied vs {} expected; missing: {missing:?}; unknown: {extra:?}). \
-                 Ferrofin adopts exactly the 10.11.8 schema generation — \
-                 bring the database to Jellyfin 10.11.x first (or restore a backup)",
-                applied.len(),
-                expected.len(),
-            ),
-        });
-    }
+    let Some(generation) = match_generation(&applied) else {
+        return Err(unsupported_generation(&applied));
+    };
 
     // One-time safety copy, WAL folded in first so the file is complete.
     sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -913,31 +1119,65 @@ async fn adopt_jellyfin_database(
         })?;
     }
 
-    // Baseline the schema-shape migrations: recorded as applied, never run.
-    conn.ensure_migrations_table().await?;
-    for migration in MIGRATOR.iter() {
-        if migration.version > JELLYFIN_SHAPE_MIGRATION_HEAD {
-            continue;
+    // Baseline + adoption record, atomically: a crash between the two would
+    // otherwise leave a database that later boots treat as "already adopted"
+    // (the history table exists) with no record of where it came from.
+    sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+    let result: Result<()> = async {
+        conn.ensure_migrations_table().await?;
+        for migration in MIGRATOR.iter() {
+            if !generation.baselined_versions.contains(&migration.version) {
+                continue;
+            }
+            sqlx::query(
+                "INSERT INTO _sqlx_migrations \
+                 (version, description, installed_on, success, checksum, execution_time) \
+                 VALUES (?1, ?2, CURRENT_TIMESTAMP, TRUE, ?3, 0)",
+            )
+            .bind(migration.version)
+            .bind(&*migration.description)
+            .bind(&*migration.checksum)
+            .execute(&mut *conn)
+            .await?;
         }
+        sqlx::query(ADOPTION_TABLE_DDL).execute(&mut *conn).await?;
         sqlx::query(
-            "INSERT INTO _sqlx_migrations \
-             (version, description, installed_on, success, checksum, execution_time) \
-             VALUES (?1, ?2, CURRENT_TIMESTAMP, TRUE, ?3, 0)",
+            r#"INSERT INTO "FerrofinAdoption" ("Generation", "AdoptedAt", "MembershipImportDone")
+               VALUES (?1, CURRENT_TIMESTAMP, 0)"#,
         )
-        .bind(migration.version)
-        .bind(&*migration.description)
-        .bind(&*migration.checksum)
+        .bind(generation.name)
         .execute(&mut *conn)
         .await?;
+        Ok(())
+    }
+    .await;
+    match result {
+        Ok(()) => {
+            sqlx::query("COMMIT").execute(&mut *conn).await?;
+        }
+        Err(e) => {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            return Err(e);
+        }
     }
     tracing::info!(
         database = %path.display(),
         backup = %backup.display(),
-        baselined_through = JELLYFIN_SHAPE_MIGRATION_HEAD,
-        "adopted an existing Jellyfin 10.11.8 database in place"
+        generation = generation.name,
+        baselined = ?generation.baselined_versions,
+        "adopted an existing Jellyfin database in place"
     );
     Ok(())
 }
+
+/// The code-created adoption record — like `_sqlx_migrations`, it lives
+/// outside the migration chain (the `Ferrofin` prefix keeps it out of the
+/// schema-conformance snapshot). One row, written with the baseline.
+const ADOPTION_TABLE_DDL: &str = r#"CREATE TABLE IF NOT EXISTS "FerrofinAdoption" (
+    "Generation" TEXT NOT NULL,
+    "AdoptedAt" TEXT NOT NULL,
+    "MembershipImportDone" INTEGER NOT NULL DEFAULT 0
+)"#;
 
 /// The migrations that rebuild Jellyfin-owned tables (the 12-step SQLite
 /// table-rebuild dance): `0007` (10.11.8 shape) and `0030` (12.0 shape). Each
@@ -1938,9 +2178,18 @@ mod tests {
         assert_eq!(counts.get("PLACEHOLDER"), Some(&1));
     }
 
-    /// Creates a file-backed database shaped exactly like a real Jellyfin
-    /// 10.11.8 one: the committed schema fixture plus the EF migration rows.
+    /// The committed 10.11.8 schema fixture.
+    const SCHEMA_10_11_8: &str = include_str!("../tests/data/jellyfin-10.11.8-schema.sql");
+    /// The committed 12.0 schema fixture.
+    const SCHEMA_12_0: &str = include_str!("../tests/data/jellyfin-12.0-schema.sql");
+
+    /// Creates a file-backed database shaped exactly like a real Jellyfin one:
+    /// a committed schema fixture plus the EF migration rows.
     async fn seed_jellyfin_fixture(path: &std::path::Path, migrations: &[&str]) {
+        seed_jellyfin_fixture_with(path, SCHEMA_10_11_8, migrations).await;
+    }
+
+    async fn seed_jellyfin_fixture_with(path: &std::path::Path, schema: &str, migrations: &[&str]) {
         use sqlx::ConnectOptions;
         let mut conn = SqliteConnectOptions::new()
             .filename(path)
@@ -1948,7 +2197,7 @@ mod tests {
             .connect()
             .await
             .expect("open fixture db");
-        sqlx::raw_sql(include_str!("../tests/data/jellyfin-10.11.8-schema.sql"))
+        sqlx::raw_sql(schema)
             .execute(&mut conn)
             .await
             .expect("apply fixture schema");
@@ -1965,6 +2214,38 @@ mod tests {
         sqlx::Connection::close(conn).await.expect("close");
     }
 
+    async fn recorded_versions(db: &Database) -> Vec<i64> {
+        sqlx::query_scalar(r#"SELECT version FROM "_sqlx_migrations" ORDER BY version"#)
+            .fetch_all(db.pool())
+            .await
+            .expect("sqlx history")
+    }
+
+    async fn table_exists(db: &Database, name: &str) -> bool {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        )
+        .bind(name)
+        .fetch_one(db.pool())
+        .await
+        .expect("sqlite_master")
+            > 0
+    }
+
+    #[test]
+    fn the_convergence_migration_is_never_baselined() {
+        for generation in &JELLYFIN_GENERATIONS {
+            assert!(
+                !generation.baselined_versions.contains(&31),
+                "{}: 0031 must run on every path",
+                generation.name
+            );
+            assert!(generation.baselined_versions.contains(&7));
+        }
+        assert!(JELLYFIN_GENERATIONS[1].baselined_versions.contains(&30));
+        assert!(!JELLYFIN_GENERATIONS[0].baselined_versions.contains(&30));
+    }
+
     #[tokio::test]
     async fn adopts_a_jellyfin_10_11_8_database_in_place() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1976,16 +2257,24 @@ mod tests {
             .await
             .expect("adoption succeeds");
 
-        // Shape migrations baselined, additive tail actually applied.
-        let versions: Vec<i64> =
-            sqlx::query_scalar(r#"SELECT version FROM "_sqlx_migrations" ORDER BY version"#)
-                .fetch_all(db.pool())
-                .await
-                .expect("sqlx history");
+        // Shape migrations baselined, everything else actually applied.
+        let versions = recorded_versions(&db).await;
         let head = MIGRATOR.iter().last().map_or(0, |m| m.version);
         let recorded = i64::try_from(versions.len()).expect("small count");
         assert_eq!(recorded, head, "every migration recorded");
-        assert!(versions.contains(&JELLYFIN_SHAPE_MIGRATION_HEAD));
+        assert!(versions.contains(&7));
+        assert!(versions.contains(&30) && versions.contains(&31));
+        // 0030 EXECUTED here (the 10.11.8 shape had to be converged), so the
+        // pre-rebuild snapshot exists; the adoption record names the generation.
+        assert!(path.with_extension("db.pre-0030").exists());
+        assert_eq!(
+            db.adoption_state().await.expect("adoption state"),
+            Some(AdoptionState {
+                generation: "10.11.8".into(),
+                membership_import_done: false
+            })
+        );
+        assert!(!table_exists(&db, "sqlite_stat1").await);
 
         // Jellyfin's bookkeeping untouched; safety copy exists.
         let ef_rows: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM "__EFMigrationsHistory""#)
@@ -2000,6 +2289,208 @@ mod tests {
         Database::connect_sized(&url, Some(2))
             .await
             .expect("re-open after adoption");
+    }
+
+    #[tokio::test]
+    async fn adopts_a_jellyfin_12_0_database_in_place() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        seed_jellyfin_fixture_with(&path, SCHEMA_12_0, &JELLYFIN_12_0_MIGRATIONS).await;
+        // What a Jellyfin 12 database always carries and Ferrofin never keeps.
+        {
+            use sqlx::ConnectOptions;
+            let mut conn = SqliteConnectOptions::new()
+                .filename(&path)
+                .connect()
+                .await
+                .expect("open");
+            sqlx::query("ANALYZE")
+                .execute(&mut conn)
+                .await
+                .expect("analyze");
+            sqlx::Connection::close(conn).await.expect("close");
+        }
+
+        let url = format!("sqlite://{}", path.display());
+        let db = Database::connect_sized(&url, Some(2))
+            .await
+            .expect("adoption succeeds");
+
+        let versions = recorded_versions(&db).await;
+        let head = MIGRATOR.iter().last().map_or(0, |m| m.version);
+        assert_eq!(i64::try_from(versions.len()).expect("small"), head);
+        assert!(versions.contains(&30), "0030 baselined");
+        assert!(versions.contains(&31), "0031 executed");
+        // 0030 was baselined, never run: no rebuild happened, no snapshot.
+        assert!(!path.with_extension("db.pre-0030").exists());
+        assert!(path.with_extension("db.pre-ferrofin").exists());
+        assert_eq!(
+            db.adoption_state().await.expect("adoption state"),
+            Some(AdoptionState {
+                generation: "12.0.0".into(),
+                membership_import_done: false
+            })
+        );
+        // 0031's hygiene ran on this path too.
+        assert!(!table_exists(&db, "sqlite_stat1").await);
+        let ef_rows: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM "__EFMigrationsHistory""#)
+            .fetch_one(db.pool())
+            .await
+            .expect("ef rows");
+        assert_eq!(ef_rows, 102);
+        // The 12.0 fixture and the converged chain must agree on the shape —
+        // the conformance test proves it for a fresh database, this proves the
+        // adopted one still passes the same schema-level integrity check.
+        let violations: Vec<sqlx::sqlite::SqliteRow> = sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(db.pool())
+            .await
+            .expect("fk check");
+        assert!(violations.is_empty());
+
+        drop(db);
+        let db = Database::connect_sized(&url, Some(2))
+            .await
+            .expect("re-open after adoption");
+        assert_eq!(recorded_versions(&db).await.len(), versions.len());
+    }
+
+    #[tokio::test]
+    async fn refuses_a_12_0_database_missing_one_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        let short = &JELLYFIN_12_0_MIGRATIONS[..JELLYFIN_12_0_MIGRATIONS.len() - 1];
+        seed_jellyfin_fixture_with(&path, SCHEMA_12_0, short).await;
+
+        let url = format!("sqlite://{}", path.display());
+        let err = Database::connect_sized(&url, Some(2))
+            .await
+            .expect_err("adoption must refuse");
+        let message = err.to_string();
+        assert!(
+            matches!(err, crate::DbError::UnsupportedJellyfinDatabase { .. }),
+            "unexpected error: {err}"
+        );
+        assert!(message.contains("closest is 12.0.0"), "{message}");
+        assert!(
+            message.contains("EnableLocalSimilarityProviders"),
+            "{message}"
+        );
+        assert!(!path.with_extension("db.pre-ferrofin").exists());
+    }
+
+    #[tokio::test]
+    async fn refuses_a_database_between_generations() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        // 10.11.8 plus five of 12.0's ids: a half-upgraded database.
+        let mut ids: Vec<&str> = JELLYFIN_10_11_8_MIGRATIONS.to_vec();
+        ids.extend(
+            JELLYFIN_12_0_MIGRATIONS
+                .iter()
+                .filter(|id| !JELLYFIN_10_11_8_MIGRATIONS.contains(id))
+                .take(5),
+        );
+        seed_jellyfin_fixture(&path, &ids).await;
+
+        let url = format!("sqlite://{}", path.display());
+        let err = Database::connect_sized(&url, Some(2))
+            .await
+            .expect_err("adoption must refuse");
+        assert!(err.to_string().contains("closest is 10.11.8"), "{err}");
+        assert!(!table_exists_at(&path, "_sqlx_migrations").await);
+        assert!(!table_exists_at(&path, "FerrofinAdoption").await);
+    }
+
+    async fn table_exists_at(path: &std::path::Path, name: &str) -> bool {
+        use sqlx::ConnectOptions;
+        let mut conn = SqliteConnectOptions::new()
+            .filename(path)
+            .connect()
+            .await
+            .expect("open");
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        )
+        .bind(name)
+        .fetch_one(&mut conn)
+        .await
+        .expect("sqlite_master");
+        sqlx::Connection::close(conn).await.expect("close");
+        n > 0
+    }
+
+    /// A crash after the baseline transaction committed but before
+    /// `MIGRATOR.run`: the next boot must skip the gate (history exists), run
+    /// the chain, and still know the generation from the adoption record.
+    #[tokio::test]
+    async fn adoption_survives_a_crash_between_baseline_and_migrations() {
+        use sqlx::ConnectOptions;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        seed_jellyfin_fixture(&path, &JELLYFIN_10_11_8_MIGRATIONS).await;
+        // Replay exactly what the adoption transaction writes, then "crash".
+        let mut conn = SqliteConnectOptions::new()
+            .filename(&path)
+            .connect()
+            .await
+            .expect("open");
+        {
+            use sqlx::migrate::Migrate;
+            conn.ensure_migrations_table().await.expect("history table");
+        }
+        for migration in MIGRATOR.iter().filter(|m| m.version <= 7) {
+            sqlx::query(
+                "INSERT INTO _sqlx_migrations \
+                 (version, description, installed_on, success, checksum, execution_time) \
+                 VALUES (?1, ?2, CURRENT_TIMESTAMP, TRUE, ?3, 0)",
+            )
+            .bind(migration.version)
+            .bind(&*migration.description)
+            .bind(&*migration.checksum)
+            .execute(&mut conn)
+            .await
+            .expect("baseline row");
+        }
+        sqlx::query(ADOPTION_TABLE_DDL)
+            .execute(&mut conn)
+            .await
+            .expect("adoption table");
+        sqlx::query(
+            r#"INSERT INTO "FerrofinAdoption" ("Generation", "AdoptedAt", "MembershipImportDone")
+               VALUES ('10.11.8', CURRENT_TIMESTAMP, 0)"#,
+        )
+        .execute(&mut conn)
+        .await
+        .expect("adoption row");
+        sqlx::Connection::close(conn).await.expect("close");
+
+        let url = format!("sqlite://{}", path.display());
+        let db = Database::connect_sized(&url, Some(2))
+            .await
+            .expect("boot after the crash completes the chain");
+        let head = MIGRATOR.iter().last().map_or(0, |m| m.version);
+        assert_eq!(
+            i64::try_from(recorded_versions(&db).await.len()).expect("small"),
+            head
+        );
+        // No second adoption happened: no safety copy was taken by the gate.
+        assert!(!path.with_extension("db.pre-ferrofin").exists());
+        assert_eq!(
+            db.adoption_state()
+                .await
+                .expect("state")
+                .map(|s| s.generation),
+            Some("10.11.8".into())
+        );
+    }
+
+    /// An install adopted before the adoption record existed (or a
+    /// Ferrofin-native database) has no record: repairs keyed on it never run.
+    #[tokio::test]
+    async fn a_database_without_an_adoption_record_reports_none() {
+        let db = Database::connect_in_memory().await.expect("connect");
+        db.run_migrations().await.expect("migrate");
+        assert_eq!(db.adoption_state().await.expect("state"), None);
     }
 
     #[tokio::test]
