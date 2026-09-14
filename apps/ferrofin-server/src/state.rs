@@ -373,6 +373,27 @@ pub async fn build_app_state(
             tracing::warn!(%err, "clean-value repair failed; punctuated by-name lookups may miss until the next scan");
         }
     }
+    // One-shot: fold every localized `UserView` (id derived from its translated
+    // name, the 10.11 rule) onto the name-independent id Jellyfin 12.0 derives
+    // from the view type, moving children, ancestors and per-user settings.
+    match ferrofin_core::user_view_repository::consolidate_localized_user_views(
+        db,
+        &id_derivation,
+        std::path::Path::new(&paths.internal_metadata_path()),
+    )
+    .await
+    {
+        Ok(0) => {}
+        Ok(dropped) => {
+            tracing::info!(
+                dropped,
+                "consolidated localized user views onto their canonical ids"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(%err, "user view consolidation failed; localized views stay duplicated until the next boot");
+        }
+    }
     let people_repository_impl = Arc::new(
         FerrofinPeopleRepository::new(db.clone())
             .with_identity(id_derivation.clone(), paths.people_path()),
