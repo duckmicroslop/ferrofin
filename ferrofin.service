@@ -1,0 +1,28 @@
+# Managed by congru: applications/ferrofin/templates/ferrofin.service
+[Unit]
+Description=Ferrofin media server
+Wants=network-online.target
+After=network-online.target remote-fs.target
+RequiresMountsFor=/var/lib/ferrofin/data
+
+[Service]
+Type=simple
+User=ferrofin
+Group=ferrofin
+WorkingDirectory=/var/lib/ferrofin/data
+ExecStartPre=/usr/bin/test -x /usr/lib/jellyfin-ffmpeg/ffmpeg
+ExecStartPre=/usr/bin/test -x /usr/lib/jellyfin-ffmpeg/ffprobe
+ExecStartPre=/usr/bin/test -r /usr/share/jellyfin/web/index.html
+ExecStart=/opt/ferrofin/current/ferrofin-server --config /etc/ferrofin/config.toml
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=45
+UMask=0027
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/ferrofin/data
+
+[Install]
+WantedBy=multi-user.target

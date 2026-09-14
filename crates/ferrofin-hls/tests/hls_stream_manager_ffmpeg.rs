@@ -286,7 +286,7 @@ fn build_manager(dir: &Path, clip: &Path) -> Mgr {
     let paths = Arc::new(TempPaths {
         transcode: dir.to_string_lossy().into_owned(),
     });
-    HlsStreamManagerImpl::new(planner, transcoder, manager, generator, paths)
+    HlsStreamManagerImpl::new(planner, transcoder, manager, generator, paths, "ffmpeg")
 }
 
 /// A request carrying the session/device the planner pins.
@@ -373,7 +373,7 @@ fn build_manager_fmp4(dir: &Path, clip: &Path) -> Mgr {
     let paths = Arc::new(TempPaths {
         transcode: dir.to_string_lossy().into_owned(),
     });
-    HlsStreamManagerImpl::new(planner, transcoder, manager, generator, paths)
+    HlsStreamManagerImpl::new(planner, transcoder, manager, generator, paths, "ffmpeg")
 }
 
 /// The fragParsingError regression pin: hls.js requests the fMP4 init and the
