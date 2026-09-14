@@ -172,7 +172,8 @@ pub fn enable_alpha_numeric_sorting(kind: BaseItemKind) -> bool {
 }
 
 /// The `SortName` C# would compute for a named item of this kind — the port of
-/// `BaseItem.CreateSortName()` including its
+/// `BaseItem.CreateSortName()`, which on 12.0 is `GetSortName(Name,
+/// EnableAlphaNumericSorting, config)` (`BaseItem.cs:945`) including its
 /// [`enable_alpha_numeric_sorting`] branch.
 ///
 /// One home for the rule, because three separate write paths
@@ -182,11 +183,23 @@ pub fn enable_alpha_numeric_sorting(kind: BaseItemKind) -> bool {
 /// filters it.
 #[must_use]
 pub fn sort_name_for(kind: BaseItemKind, name: &str) -> String {
-    if enable_alpha_numeric_sorting(kind) {
-        ferrofin_util::sort_name::create_sort_name(name)
-    } else {
-        name.trim_start().to_owned()
-    }
+    ferrofin_util::sort_name::get_sort_name(name, enable_alpha_numeric_sorting(kind))
+}
+
+/// The `SortName` C# derives from a non-empty `ForcedSortName` for an item of
+/// this kind — `GetSortName(ForcedSortName, EnableAlphaNumericSorting, config)`
+/// (12.0 `BaseItem.cs:549`).
+///
+/// The same rule as [`sort_name_for`], deliberately: since 12.0 a forced sort
+/// name is cleaned exactly like an auto-generated one so the two sort together
+/// (jellyfin#17388), and `Person` (`EnableAlphaNumericSorting => false`) keeps
+/// its override verbatim apart from `TrimStart()`. It is a separate name so a
+/// call site reads as the forced branch, and because it bypasses the per-kind
+/// `CreateSortName` overrides (episode/season/audio prefixes) that only the
+/// derived branch carries.
+#[must_use]
+pub fn forced_sort_name_for(kind: BaseItemKind, forced: &str) -> String {
+    ferrofin_util::sort_name::get_sort_name(forced, enable_alpha_numeric_sorting(kind))
 }
 
 /// Whether items of this kind can own media sources — the rows in
