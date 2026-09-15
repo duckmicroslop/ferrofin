@@ -359,7 +359,8 @@ pub async fn build_app_state(
     // Adopted Jellyfin rows store the metadata/data directories as
     // `%MetadataPath%`/`%AppDataPath%`; every reader of image paths expands
     // them against this server's directories (`BaseItemRepository.Map`).
-    let virtual_paths = ferrofin_core::virtual_paths::VirtualPathExpander::from_paths(&*paths);
+    let virtual_paths =
+        ferrofin_core::virtual_paths::VirtualPathExpander::from_paths(Arc::clone(&paths));
     let item_repository: Arc<dyn ferrofin_traits::persistence::ItemRepository> = Arc::new(
         FerrofinItemRepository::new(db.clone(), Arc::clone(&item_type_lookup))
             .with_root_ids(root_folder_ids)

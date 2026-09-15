@@ -112,7 +112,7 @@ maintainer-scripts = "../../contrib/debian"
 assets = [
     ["target/release/ferrofin-server", "usr/bin/ferrofin-server", "755"],
     ["../../contrib/systemd/ferrofin.service", "lib/systemd/system/ferrofin.service", "644"],
-    ["../../contrib/debian/config.toml", "etc/ferrofin/config.toml", "644"],
+    ["../../contrib/debian/config.toml", "etc/ferrofin/config.toml", "640"],
     ["../../README.md", "usr/share/doc/ferrofin/README.md", "644"],
     ["../../docs/INSTALL.md", "usr/share/doc/ferrofin/INSTALL.md", "644"],
     ["../../docs/CONFIG.md", "usr/share/doc/ferrofin/CONFIG.md", "644"],

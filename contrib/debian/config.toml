@@ -9,8 +9,9 @@ data_dir = "/var/lib/ferrofin/data"
 bind_addr = "0.0.0.0"
 port = 8096
 
-# Set for a headless first boot; otherwise the generated admin password is
-# logged once to the journal.
+# Set for a headless first boot; otherwise set the password in the web setup
+# wizard. Keep this file owned by root:ferrofin, mode 0640. You can remove this
+# entry once the account exists; it is only used when creating the first user.
 #admin_password = ""
 
 # Public URL clients should be told to use, when behind a reverse proxy.

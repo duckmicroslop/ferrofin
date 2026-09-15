@@ -10,6 +10,8 @@
 //! Ferrofin's side. Ferrofin writes resolved paths, so expanding on read is
 //! the identity for rows it wrote itself.
 
+use std::sync::Arc;
+
 use ferrofin_traits::system::ServerApplicationPaths;
 
 use crate::app_paths::FerrofinServerApplicationPaths;
@@ -21,20 +23,15 @@ use crate::app_paths::FerrofinServerApplicationPaths;
 /// that have no paths and store none of the tokens.
 #[derive(Debug, Clone, Default)]
 pub struct VirtualPathExpander {
-    /// The `%AppDataPath%` replacement, or empty for no substitution.
-    data: String,
-    /// The `%MetadataPath%` replacement, or empty for no substitution.
-    metadata: String,
+    /// Shared paths so metadata-directory changes take effect without a restart.
+    paths: Option<Arc<FerrofinServerApplicationPaths>>,
 }
 
 impl VirtualPathExpander {
-    /// An expander for this server's directories.
+    /// An expander that follows this server's current directories.
     #[must_use]
-    pub fn from_paths(paths: &dyn ServerApplicationPaths) -> Self {
-        Self {
-            data: paths.data_path(),
-            metadata: paths.internal_metadata_path(),
-        }
+    pub fn from_paths(paths: Arc<FerrofinServerApplicationPaths>) -> Self {
+        Self { paths: Some(paths) }
     }
 
     /// An expander that leaves every path alone.
@@ -47,15 +44,18 @@ impl VirtualPathExpander {
     /// `string.Replace(…, StringComparison.OrdinalIgnoreCase)` does upstream.
     #[must_use]
     pub fn expand(&self, path: &str) -> String {
+        let Some(paths) = &self.paths else {
+            return path.to_owned();
+        };
         let data = replace_ignore_ascii_case(
             path,
             FerrofinServerApplicationPaths::VIRTUAL_DATA_PATH,
-            &self.data,
+            &paths.data_path(),
         );
         replace_ignore_ascii_case(
             &data,
             FerrofinServerApplicationPaths::VIRTUAL_INTERNAL_METADATA_PATH,
-            &self.metadata,
+            &paths.internal_metadata_path(),
         )
     }
 
@@ -69,10 +69,7 @@ impl VirtualPathExpander {
 /// Case-insensitive `String.Replace` of every occurrence of `from` with `to`.
 ///
 /// Mirrors C# `string.Replace(old, new, StringComparison.OrdinalIgnoreCase)`.
-/// An empty `from` is a no-op (avoids an infinite loop); an empty `to` with a
-/// non-empty `from` deletes the token, which is why the identity expander keeps
-/// its tokens by never being asked — see [`VirtualPathExpander::expand`]'s
-/// callers, which only construct one from real paths.
+/// Empty search or replacement strings leave the input unchanged.
 pub(crate) fn replace_ignore_ascii_case(haystack: &str, from: &str, to: &str) -> String {
     if from.is_empty() || to.is_empty() {
         return haystack.to_owned();
@@ -96,10 +93,40 @@ mod tests {
     use super::*;
 
     fn expander() -> VirtualPathExpander {
-        VirtualPathExpander {
-            data: "/var/lib/ferrofin/data".to_owned(),
-            metadata: "/var/lib/ferrofin/data/metadata".to_owned(),
+        let paths = Arc::new(FerrofinServerApplicationPaths::new(
+            "/var/lib/ferrofin",
+            "log",
+            "config",
+            "cache",
+            "web",
+        ));
+        paths.set_internal_metadata_path(Some("/var/lib/ferrofin/data/metadata"));
+        VirtualPathExpander::from_paths(paths)
+    }
+
+    #[test]
+    fn cloned_expanders_follow_metadata_directory_changes() {
+        let paths = Arc::new(FerrofinServerApplicationPaths::new(
+            "/data", "log", "config", "cache", "web",
+        ));
+        let original = VirtualPathExpander::from_paths(Arc::clone(&paths));
+        let cloned = original.clone();
+        assert_eq!(
+            original.expand("%MetadataPath%/poster.jpg"),
+            "/data/metadata/poster.jpg"
+        );
+        paths.set_internal_metadata_path(Some("/new-metadata"));
+        for expander in [&original, &cloned] {
+            assert_eq!(
+                expander.expand("%MetadataPath%/poster.jpg"),
+                "/new-metadata/poster.jpg"
+            );
         }
+        paths.set_internal_metadata_path(None);
+        assert_eq!(
+            cloned.expand("%MetadataPath%/poster.jpg"),
+            "/data/metadata/poster.jpg"
+        );
     }
 
     #[test]

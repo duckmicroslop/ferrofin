@@ -1,8 +1,8 @@
 #!/bin/sh
 # Ferrofin .deb postinst: create the service user and data directory, register
 # the unit. The service is deliberately NOT enabled or started — the first boot
-# logs the generated admin password once, and the operator should be watching
-# `journalctl -u ferrofin` when that happens (see INSTALL.md).
+# needs the operator to configure a password or complete the web setup wizard
+# (see INSTALL.md).
 set -e
 
 if [ "$1" = "configure" ]; then
@@ -14,6 +14,14 @@ if [ "$1" = "configure" ]; then
     fi
     # 0750: the database inside is nobody else's business.
     install -d -o ferrofin -g ferrofin -m 0750 /var/lib/ferrofin /var/lib/ferrofin/data
+
+    # The conffile may contain the bootstrap admin password. Apply this on
+    # upgrades too, after the service group exists, without changing contents.
+    # Preserve an explicit administrator override and a deliberately deleted file.
+    if [ -f /etc/ferrofin/config.toml ] && ! dpkg-statoverride --list /etc/ferrofin/config.toml >/dev/null; then
+        chown root:ferrofin /etc/ferrofin/config.toml
+        chmod 0640 /etc/ferrofin/config.toml
+    fi
 
     if [ -d /run/systemd/system ]; then
         systemctl daemon-reload >/dev/null 2>&1 || true

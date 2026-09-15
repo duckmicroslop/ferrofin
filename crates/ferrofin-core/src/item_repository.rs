@@ -3774,7 +3774,8 @@ mod tests {
         // With the server's paths it is the file the copied metadata/ holds.
         let root = tempfile::tempdir().expect("tempdir");
         let paths = crate::app_paths::test_paths(root.path());
-        let repository = repo(&db).with_virtual_paths(VirtualPathExpander::from_paths(&*paths));
+        let repository =
+            repo(&db).with_virtual_paths(VirtualPathExpander::from_paths(Arc::clone(&paths)));
         let images = repository.get_image_infos(item).await.expect("images");
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].image_type, ImageType::Logo);

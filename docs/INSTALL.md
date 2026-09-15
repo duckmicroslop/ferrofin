@@ -49,8 +49,8 @@ sudo apt-get install -y "./ferrofin_${V}_$A.deb"
 ```
 
 The package creates the `ferrofin` system user and `/var/lib/ferrofin/data`, installs the
-unit, and **does not enable or start it**: the first boot logs the generated admin password
-once, and you want to be watching when it does. Give the `ferrofin` user read access to your
+unit, and **does not enable or start it**: configure a password or be ready to complete
+the web setup wizard on first boot. Give the `ferrofin` user read access to your
 media, typically by adding it to the group that owns the library. Keep the service stopped
 until you choose the fresh-install or migration procedure in step 4 below.
 
@@ -67,10 +67,10 @@ curl -fsSLO "https://github.com/mangoleaf/ferrofin/releases/download/$V/ferrofin
 sha256sum -c "ferrofin-$V-$T.tar.gz.sha256"
 tar xzf "ferrofin-$V-$T.tar.gz"
 sudo install -m 755 "ferrofin-$V-$T/ferrofin-server" /usr/local/bin/ferrofin-server
-sudo useradd --system --home /var/lib/ferrofin --shell /usr/sbin/nologin ferrofin
+sudo useradd --system --user-group --home /var/lib/ferrofin --shell /usr/sbin/nologin ferrofin
 sudo install -d -o ferrofin -g ferrofin -m 0750 /var/lib/ferrofin /var/lib/ferrofin/data
 sudo install -d /etc/ferrofin
-sudo install -m 644 contrib/debian/config.toml /etc/ferrofin/config.toml
+sudo install -o root -g ferrofin -m 640 contrib/debian/config.toml /etc/ferrofin/config.toml
 sudo install -m 644 contrib/systemd/ferrofin.service /etc/systemd/system/ferrofin.service
 sudo mkdir -p /etc/systemd/system/ferrofin.service.d
 printf '[Service]\nExecStart=\nExecStart=/usr/local/bin/ferrofin-server --config /etc/ferrofin/config.toml\n' \
@@ -109,14 +109,21 @@ If you are migrating from Jellyfin, skip this subsection. Starting against an em
 directory creates `ferrofin.db` and JSON configuration, which take precedence over the
 Jellyfin database and XML files you would copy later.
 
+For a headless first boot, you can set `admin_password` in
+`/etc/ferrofin/config.toml` using `sudoedit` before starting the service. A local
+config file is sufficient: the package makes it readable only by root and the
+`ferrofin` group (`root:ferrofin`, mode `0640`). No secret-management service is
+required. Once the account exists, you can remove the `admin_password` entry;
+it is only used when creating the first user and does not reset existing passwords.
+Alternatively, leave it unset and set the password in the web setup wizard.
+Ferrofin does not generate or log an administrator password.
+
 ```sh
 sudo systemctl enable --now ferrofin
-journalctl -u ferrofin -f
+journalctl -u ferrofin -f                         # startup diagnostics
 ```
 
-On a fresh database the log prints the generated `admin` password once; record it. For a
-headless install, set `admin_password` in `/etc/ferrofin/config.toml` (or
-`FERROFIN_ADMIN_PASSWORD` in the unit) before first start. Open `http://host:8096/web`.
+Open `http://host:8096/web`.
 
 ### Migrate an existing Jellyfin installation
 
