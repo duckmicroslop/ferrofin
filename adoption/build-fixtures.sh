@@ -20,15 +20,18 @@ while [ $# -gt 0 ]; do case $1 in --fixtures) FIXTURES=$2; shift 2;; -h|--help) 
 [ -n "$FIXTURES" ] || { echo "--fixtures DIR is required" >&2; exit 2; }
 FIXTURES=$(cd "$FIXTURES" && pwd); SRC=$FIXTURES/jellyfin-10.11.8
 [ -f "$SRC/data/jellyfin.db" ] || { echo "no $SRC/data/jellyfin.db" >&2; exit 2; }
-MEDIA=(); [ -f "$FIXTURES/media-mounts.sh" ] && . "$FIXTURES/media-mounts.sh"
+MEDIA=()
+# shellcheck disable=SC1091 # user-supplied, outside the repository
+[ ! -f "$FIXTURES/media-mounts.sh" ] || . "$FIXTURES/media-mounts.sh"
 count=$(sqlite3 -readonly "file:$SRC/data/jellyfin.db?immutable=1" 'SELECT COUNT(*) FROM __EFMigrationsHistory')
 [ "$count" = 68 ] || { echo "$SRC has $count EF migration ids, a 10.11.8 database has 68" >&2; exit 2; }
 
 boot_jellyfin() { # boot_jellyfin <image> <dir> <port> — one boot, wait, let startup tasks run, stop cleanly
-  local image=$1 dir=$2 port=$3 name=fixture-$port i
+  local image=$1 dir=$2 port=$3
+  local name=fixture-$port
   mkdir -p "$dir-cache"; docker rm -f "$name" >/dev/null 2>&1 || true
   docker run -d --name "$name" --user "$(id -u):$(id -g)" -p "127.0.0.1:$port:8096" -v "$dir:/config" -v "$dir-cache:/cache" "${MEDIA[@]}" "$image" >/dev/null
-  for i in $(seq 1 600); do curl -sf "http://127.0.0.1:$port/System/Info/Public" >/dev/null && break; sleep 3; done
+  for _ in $(seq 1 600); do curl -sf "http://127.0.0.1:$port/System/Info/Public" >/dev/null && break; sleep 3; done
   sleep 90
   docker logs "$name" > "$dir-migration.log" 2>&1; docker stop -t 60 "$name" >/dev/null; docker rm "$name" >/dev/null
   sqlite3 "$dir/data/jellyfin.db" 'PRAGMA wal_checkpoint(TRUNCATE);' >/dev/null
@@ -52,7 +55,7 @@ if [ ! -f "$FIXTURES/oracle/smoke-jellyfin-12.1.txt" ]; then
   cp -a "$FIXTURES/jellyfin-12.1-from-12" "$tmp"; mkdir -p "$tmp-cache"
   docker rm -f fixture-oracle >/dev/null 2>&1 || true
   docker run -d --name fixture-oracle --user "$(id -u):$(id -g)" -p 127.0.0.1:18095:8096 -v "$tmp:/config" -v "$tmp-cache:/cache" "${MEDIA[@]}" jellyfin/jellyfin:12.1 >/dev/null
-  for i in $(seq 1 300); do curl -sf http://127.0.0.1:18095/System/Info/Public >/dev/null && break; sleep 3; done; sleep 30
+  for _ in $(seq 1 300); do curl -sf http://127.0.0.1:18095/System/Info/Public >/dev/null && break; sleep 3; done; sleep 30
   "$HERE/smoke.sh" http://127.0.0.1:18095 "$tmp" "${ADOPTION_USER:-}" > "$FIXTURES/oracle/smoke-jellyfin-12.1.txt"
   # run.sh probes every fixture as this same account
   sed -n 's/^200  \([^ ]*\) admin=.*\/Users\/Me$/\1/p' "$FIXTURES/oracle/smoke-jellyfin-12.1.txt" > "$FIXTURES/oracle/user.txt"

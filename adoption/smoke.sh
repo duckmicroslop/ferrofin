@@ -8,14 +8,13 @@
 # user defaults to the administrator with the most recently active "Jellyfin Web" session
 # (the same account on every copy of one library); pass a username to pin it.
 set -uo pipefail
+HERE=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=adoption/lib.sh
+. "$HERE/lib.sh"
 BASE=${1:?base url}; DB=${2:?data dir}/data/jellyfin.db; WANT_USER=${3:-${ADOPTION_USER:-}}
 q() { sqlite3 -readonly "file:$DB?mode=ro" "$1"; }
 APIKEY=$(q 'SELECT AccessToken FROM ApiKeys ORDER BY DateCreated DESC LIMIT 1')
-# PermissionKind.IsAdministrator = 0
-if [ -n "$WANT_USER" ]; then where="u.Username = '$WANT_USER'"; else where="EXISTS (SELECT 1 FROM Permissions p WHERE p.UserId = u.Id AND p.Kind = 0 AND p.Value = 1)"; fi
-read -r USER_NAME USER_TOKEN USER_DEVICE < <(q "SELECT u.Username, d.AccessToken, d.DeviceId FROM Devices d JOIN Users u ON u.Id = d.UserId WHERE $where AND d.AppName = 'Jellyfin Web' ORDER BY d.DateLastActivity DESC LIMIT 1" | tr '|' ' ')
-[ -n "${USER_TOKEN:-}" ] || { echo "smoke: no Jellyfin Web session token for ${WANT_USER:-any user} in $DB" >&2; exit 2; }
-USER_ID=$(q "SELECT lower(replace(Id,'-','')) FROM Users WHERE Username = '$USER_NAME'")
+read -r _ USER_TOKEN USER_DEVICE USER_ID < <(adoption_smoke_credentials "$DB" "$WANT_USER") || exit 2
 ADMIN="Authorization: MediaBrowser Token=\"$APIKEY\", Client=\"smoke\", Device=\"smoke\", DeviceId=\"smoke\", Version=\"1\""
 USERH="Authorization: MediaBrowser Token=\"$USER_TOKEN\", Client=\"Jellyfin Web\", Device=\"Chrome\", DeviceId=\"$USER_DEVICE\", Version=\"10.11.8\""
 hit() { # hit <auth-header|-> <jq-expr> <path>

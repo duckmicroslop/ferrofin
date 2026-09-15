@@ -70,6 +70,15 @@ The second column is the generation the gate matched — the id *set*, so 10.11.
 A `FAIL` line names every check that failed and points at the diff; the copy is kept under
 `work/` with `<name>.server.log`, `<name>.smoke.txt` and `<name>.smoke2.txt` beside it.
 
+## Tests
+
+`adoption/tests/adoption.bats` covers the harness itself without docker or fixtures: the
+checks in `lib.sh` (log parsing, smoke normalisation and comparison, the SQLite checks, the
+second-boot repair detection, the credential picker) run against canned logs, smoke outputs
+and throwaway SQLite files, and the two entry points are exercised for their refusals and the
+missing-fixture path. CI runs them with `bats adoption/tests` next to `scripts/tests`; locally
+`mise exec bats@latest -- bats adoption/tests` or a system `bats` works.
+
 ## Adding a generation
 
 When Jellyfin ships a release with new `__EFMigrationsHistory` ids: add a builder step that

@@ -16,6 +16,8 @@
 # must contain and how build-fixtures.sh derives everything from one 10.11.8 snapshot.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=adoption/lib.sh
+. "$HERE/lib.sh"
 FIXTURES=${FERROFIN_ADOPTION_FIXTURES:-}; IMAGE=${IMAGE:-ferrofin:bench}; ONLY=; USER_NAME=${ADOPTION_USER:-}
 while [ $# -gt 0 ]; do case $1 in
   --fixtures) FIXTURES=$2; shift 2;; --image) IMAGE=$2; shift 2;; --only) ONLY=$2; shift 2;; --user) USER_NAME=$2; shift 2;;
@@ -28,7 +30,9 @@ ORACLE=$FIXTURES/oracle/smoke-jellyfin-12.1.txt
 [ -f "$ORACLE" ] || { echo "run: $ORACLE missing — run adoption/build-fixtures.sh first" >&2; exit 2; }
 # the probes must run as the account the oracle ran as; the builder records it
 [ -n "$USER_NAME" ] || [ ! -f "$FIXTURES/oracle/user.txt" ] || USER_NAME=$(cat "$FIXTURES/oracle/user.txt")
-MEDIA=(); [ -f "$FIXTURES/media-mounts.sh" ] && . "$FIXTURES/media-mounts.sh"
+MEDIA=()
+# shellcheck disable=SC1091 # user-supplied, outside the repository
+[ ! -f "$FIXTURES/media-mounts.sh" ] || . "$FIXTURES/media-mounts.sh"
 # name|fixture directory|host port
 # The generation is the id SET the gate matches, so 10.11.9 adopts as "10.11.8" (it adds no
 # migration) and 10.11.10 as "10.11.11" (both add the three NormalizedUsername ids).
@@ -41,12 +45,8 @@ FIXTURE_TABLE=(
   "12.1.0|jellyfin-12.1-from-10|18093"
   "12.1.0|jellyfin-12.1-from-12|18092"
 )
-# answers that legitimately differ between Ferrofin and Jellyfin, or between two boots
-IGNORE='/System/Info|/ScheduledTasks|/Plugins|/Devices|/Library/VirtualFolders|/System/ActivityLog|/Sessions'
-normalise() { sed -E 's/[0-9a-f]{32}/<id>/g; s/\(bytes=[0-9]+\)/(bytes)/' "$1" | grep -Ev "$IGNORE"; }
-wait_ready() { local port=$1 i; for i in $(seq 1 300); do curl -sf "http://127.0.0.1:$port/System/Info/Public" >/dev/null && return 0; sleep 2; done; return 1; }
-settle() { local port=$1 auth=$2 i busy; for i in $(seq 1 60); do busy=$(curl -sf "http://127.0.0.1:$port/ScheduledTasks" -H "$auth" 2>/dev/null | jq -r '[.[]|select(.State!="Idle")]|length' 2>/dev/null); [ "${busy:-1}" = 0 ] && break; sleep 2; done; sleep 5; }
-REPAIR_RE='imported playlist|repaired |rewrote |recomputed |merged |backfilled |dropped dead|consolidat|reverted'
+wait_ready() { local port=$1; for _ in $(seq 1 300); do curl -sf "http://127.0.0.1:$port/System/Info/Public" >/dev/null && return 0; sleep 2; done; return 1; }
+settle() { local port=$1 auth=$2 busy; for _ in $(seq 1 60); do busy=$(curl -sf "http://127.0.0.1:$port/ScheduledTasks" -H "$auth" 2>/dev/null | jq -r '[.[]|select(.State!="Idle")]|length' 2>/dev/null); [ "${busy:-1}" = 0 ] && break; sleep 2; done; sleep 5; }
 failed=0
 for spec in "${FIXTURE_TABLE[@]}"; do
   IFS='|' read -r expected src port <<<"$spec"
@@ -58,33 +58,26 @@ for spec in "${FIXTURE_TABLE[@]}"; do
   docker run -d --name "$name" --user "$(id -u):$(id -g)" -p "127.0.0.1:$port:8096" \
     -e FERROFIN_DATA_DIR=/config -e FERROFIN_CACHE_DIR=/cache \
     -v "$dst:/config" -v "$dst-cache:/cache" "${MEDIA[@]}" "$IMAGE" >/dev/null
-  verdict=PASS; why=()
-  wait_ready "$port" || { verdict=FAIL; why+=("never became ready"); }
+  why=()
+  wait_ready "$port" || why+=("never became ready")
   APIKEY=$(sqlite3 -readonly "file:$dst/data/jellyfin.db?mode=ro" 'SELECT AccessToken FROM ApiKeys ORDER BY DateCreated DESC LIMIT 1')
   AUTH="Authorization: MediaBrowser Token=\"$APIKEY\", Client=\"adoption\", Device=\"adoption\", DeviceId=\"adoption\", Version=\"1\""
   settle "$port" "$AUTH"
-  log=$(docker logs "$name" 2>&1)
-  gen=$(grep -o '"generation":"[^"]*"' <<<"$log" | head -1 | cut -d'"' -f4)
-  [ "$gen" = "$expected" ] || { verdict=FAIL; why+=("generation '$gen' != '$expected'"); }
-  grep -q '"database migrations applied"' <<<"$log" || { verdict=FAIL; why+=("migrations did not complete"); }
-  grep -Eq '"level":"ERROR"' <<<"$log" && { verdict=FAIL; why+=("ERROR in boot log"); }
+  docker logs "$name" > "$dst.boot.log" 2>&1
+  mapfile -t -O "${#why[@]}" why < <(adoption_check_boot_log "$dst.boot.log" "$expected")
   "$HERE/smoke.sh" "http://127.0.0.1:$port" "$dst" "$USER_NAME" > "$dst.smoke.txt" 2>&1
-  diff -q <(normalise "$ORACLE") <(normalise "$dst.smoke.txt") >/dev/null || { verdict=FAIL; why+=("smoke differs from Jellyfin 12.1 (diff $ORACLE $dst.smoke.txt)"); }
-  # IX_Peoples_NameLower is an expression index on lower("Name"): the host CLI's lower() may be
-  # ICU-aware while the servers' is not, so its rows are reported "missing from index" on a
-  # file both servers agree with. Only that index is exempt.
-  ic=$(sqlite3 -readonly "file:$dst/data/jellyfin.db?mode=ro" 'PRAGMA integrity_check' | grep -v 'missing from index IX_Peoples_NameLower' | head -1)
-  [ -z "$ic" ] || [ "$ic" = ok ] || { verdict=FAIL; why+=("integrity_check: $ic"); }
-  fk=$(sqlite3 -readonly "file:$dst/data/jellyfin.db?mode=ro" 'PRAGMA foreign_key_check' | wc -l)
-  [ "$fk" = 0 ] || { verdict=FAIL; why+=("foreign_key_check: $fk rows"); }
-  docker restart "$name" >/dev/null; wait_ready "$port" || { verdict=FAIL; why+=("second boot never ready"); }
+  mapfile -t -O "${#why[@]}" why < <(adoption_compare_smoke "$ORACLE" "$dst.smoke.txt")
+  mapfile -t -O "${#why[@]}" why < <(adoption_check_db "$dst/data/jellyfin.db")
+  docker restart "$name" >/dev/null; wait_ready "$port" || why+=("second boot never ready")
   settle "$port" "$AUTH"
-  second=$(docker logs --since "$(date -u -d '-90 seconds' +%Y-%m-%dT%H:%M:%S)" "$name" 2>&1 | grep -E "$REPAIR_RE" | grep -v '"repaired":0' | head -1)
-  [ -z "$second" ] || { verdict=FAIL; why+=("second boot repaired again: $(cut -c1-120 <<<"$second")"); }
+  docker logs --since "$(date -u -d '-90 seconds' +%Y-%m-%dT%H:%M:%S)" "$name" > "$dst.boot2.log" 2>&1
+  second=$(adoption_second_boot_repairs "$dst.boot2.log")
+  [ -z "$second" ] || why+=("second boot repaired again: $second")
   "$HERE/smoke.sh" "http://127.0.0.1:$port" "$dst" "$USER_NAME" > "$dst.smoke2.txt" 2>&1
-  diff -q <(normalise "$dst.smoke.txt") <(normalise "$dst.smoke2.txt") >/dev/null || { verdict=FAIL; why+=("second boot answers differ"); }
+  diff -q <(adoption_normalise "$dst.smoke.txt") <(adoption_normalise "$dst.smoke2.txt") >/dev/null || why+=("second boot answers differ")
+  verdict=PASS; [ "${#why[@]}" = 0 ] || verdict=FAIL
   docker logs "$name" > "$dst.server.log" 2>&1; docker rm -f "$name" >/dev/null
-  printf '%-5s %-9s %-28s %s\n' "$verdict" "$expected" "$src" "${why[*]:-}"
-  if [ "$verdict" = PASS ]; then rm -rf "$dst" "$dst-cache"; else failed=1; fi
+  printf '%-5s %-9s %-28s %s\n' "$verdict" "$expected" "$src" "$(IFS='; '; echo "${why[*]:-}")"
+  if [ "$verdict" = PASS ]; then rm -rf "$dst" "$dst-cache" "$dst".*; else failed=1; fi
 done
 exit $failed
