@@ -149,6 +149,7 @@
 
 pub mod access_schedule_repository;
 pub mod activity_manager;
+pub mod adoption_repairs;
 pub mod aggregate_folder;
 pub mod api_key_manager;
 pub mod app_paths;

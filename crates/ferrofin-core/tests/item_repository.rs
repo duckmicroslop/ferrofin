@@ -589,8 +589,8 @@ async fn linked_child_ancestor_filter_finds_collections_of_a_library() {
         .await
         .expect("ancestor");
     sqlx::query(
-        r#"INSERT INTO "FerrofinLinkedChildren" ("ParentId", "ChildId", "ChildType")
-           VALUES (?1, ?2, 0)"#,
+        r#"INSERT INTO "LinkedChildren" ("ParentId", "SortOrder", "ChildId", "ChildType")
+                   VALUES (?1, (SELECT COALESCE(MAX("SortOrder"), -1) + 1 FROM "LinkedChildren" WHERE "ParentId" = ?1), ?2, 0)"#,
     )
     .bind(in_lib_set.to_string().to_uppercase())
     .bind(movie.to_string().to_uppercase())

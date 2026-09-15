@@ -492,13 +492,13 @@ pub(crate) fn append_predicates<'a>(
         } else {
             // Direct children: the physical `ParentId`, plus manually linked
             // members (C# `Folder.GetChildren` merges `LinkedChildren`). Only
-            // box-sets and playlists carry `FerrofinLinkedChildren` rows, so the `IN`
+            // box-sets and playlists carry `LinkedChildren` rows, so the `IN`
             // subquery is empty for ordinary folders and this stays identical to
             // a plain `ParentId` equality for non-collection browses.
             qb.push(r#" AND (bi."ParentId" = "#)
                 .push_bind(guid_to_db(filter.parent_id))
                 .push(
-                    r#" OR bi."Id" IN (SELECT "ChildId" FROM "FerrofinLinkedChildren" WHERE "ParentId" = "#,
+                    r#" OR bi."Id" IN (SELECT "ChildId" FROM "LinkedChildren" WHERE "ParentId" = "#,
                 )
                 .push_bind(guid_to_db(filter.parent_id))
                 .push(r#" AND "ChildType" = 0)"#);
@@ -1570,10 +1570,10 @@ fn append_ancestor_predicates(qb: &mut QueryBuilder<'_, Sqlite>, filter: &Intern
     // children descend from any of the requested ancestors — the Collections
     // tab's re-rooted query (C# TranslateQuery `LinkedChildAncestorIds` over
     // `context.LinkedChildren`; the manual links live in Ferrofin's
-    // `FerrofinLinkedChildren`).
+    // `LinkedChildren`).
     if !filter.linked_child_ancestor_ids.is_empty() {
         qb.push(
-            r#" AND EXISTS (SELECT 1 FROM "FerrofinLinkedChildren" lc
+            r#" AND EXISTS (SELECT 1 FROM "LinkedChildren" lc
                 JOIN "AncestorIds" la ON la."ItemId" = lc."ChildId"
                 WHERE lc."ParentId" = bi."Id" AND "#,
         );

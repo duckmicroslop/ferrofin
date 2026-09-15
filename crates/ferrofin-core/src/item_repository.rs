@@ -1530,7 +1530,7 @@ const PLAYLIST_ITEMS_SQL: &str = r#"SELECT ch.*,
        p."OwnerUserId" AS "PlaylistOwnerUserId",
        p."OpenAccess"  AS "PlaylistOpenAccess",
        s."CanEdit"     AS "PlaylistShareCanEdit"
-   FROM "FerrofinLinkedChildren" lc
+   FROM "LinkedChildren" lc
    JOIN "BaseItems" pl ON pl."Id" = lc."ParentId"
    JOIN "BaseItems" ch ON ch."Id" = lc."ChildId"
    LEFT JOIN "FerrofinPlaylists" p ON p."PlaylistId" = lc."ParentId"
@@ -3501,14 +3501,12 @@ mod tests {
         assert_eq!(rows[0].id, guid_to_db(movie));
 
         // Removing the membership makes the browse empty again.
-        sqlx::query(
-            r#"DELETE FROM "FerrofinLinkedChildren" WHERE "ParentId" = ?1 AND "ChildId" = ?2"#,
-        )
-        .bind(guid_to_db(boxset))
-        .bind(guid_to_db(movie))
-        .execute(db.writer())
-        .await
-        .expect("remove_from_collection");
+        sqlx::query(r#"DELETE FROM "LinkedChildren" WHERE "ParentId" = ?1 AND "ChildId" = ?2"#)
+            .bind(guid_to_db(boxset))
+            .bind(guid_to_db(movie))
+            .execute(db.writer())
+            .await
+            .expect("remove_from_collection");
         assert!(
             repository
                 .get_item_list(&query)

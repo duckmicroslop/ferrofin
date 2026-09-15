@@ -851,25 +851,45 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             // Containers whose membership shrinks need their Data JSON
             // re-synced after the delete (captured before the edges go).
             let parents: Vec<String> = sqlx::query_scalar(
-                r#"SELECT DISTINCT "ParentId" FROM "FerrofinLinkedChildren" WHERE "ChildId" = ?1"#,
+                r#"SELECT DISTINCT "ParentId" FROM "LinkedChildren" WHERE "ChildId" = ?1"#,
             )
             .bind(&id_db)
             .fetch_all(self.db.pool())
             .await
             .map_err(db_err)?;
             touched_parents.extend(parents.iter().filter_map(|p| Uuid::parse_str(p).ok()));
-            // `FerrofinLinkedChildren` is the one BaseItems FK without `ON DELETE
-            // CASCADE` (it references the item as both parent and child), so
-            // clear those links first — otherwise deleting a
-            // playlist/collection, or an item that belongs to one, trips a
-            // FOREIGN KEY constraint (787).
-            sqlx::query(
-                r#"DELETE FROM "FerrofinLinkedChildren" WHERE "ParentId" = ?1 OR "ChildId" = ?1"#,
-            )
-            .bind(&id_db)
-            .execute(self.db.writer())
-            .await
-            .map_err(db_err)?;
+            // Two BaseItems FKs have no `ON DELETE CASCADE`: `LinkedChildren`
+            // (references the item as both parent and child) and, since 12.0,
+            // `OwnerId` (an extra's owner). Upstream deletes an item's extras
+            // with it (`LibraryManager.DeleteItem` includes `GetExtras()`), so
+            // the owned rows go first — their own child rows cascade — then
+            // the links, then the item; otherwise a FOREIGN KEY constraint
+            // (787) trips.
+            let extras: Vec<String> =
+                sqlx::query_scalar(r#"SELECT "Id" FROM "BaseItems" WHERE "OwnerId" = ?1"#)
+                    .bind(&id_db)
+                    .fetch_all(self.db.pool())
+                    .await
+                    .map_err(db_err)?;
+            for extra in &extras {
+                sqlx::query(
+                    r#"DELETE FROM "LinkedChildren" WHERE "ParentId" = ?1 OR "ChildId" = ?1"#,
+                )
+                .bind(extra)
+                .execute(self.db.writer())
+                .await
+                .map_err(db_err)?;
+                sqlx::query(r#"DELETE FROM "BaseItems" WHERE "Id" = ?1"#)
+                    .bind(extra)
+                    .execute(self.db.writer())
+                    .await
+                    .map_err(db_err)?;
+            }
+            sqlx::query(r#"DELETE FROM "LinkedChildren" WHERE "ParentId" = ?1 OR "ChildId" = ?1"#)
+                .bind(&id_db)
+                .execute(self.db.writer())
+                .await
+                .map_err(db_err)?;
             sqlx::query(r#"DELETE FROM "BaseItems" WHERE "Id" = ?1"#)
                 .bind(&id_db)
                 .execute(self.db.writer())
@@ -920,16 +940,47 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             .unwrap_or(item_id)
             .as_simple()
             .to_string();
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         sqlx::query(
             r#"UPDATE "BaseItems" SET "PrimaryVersionId" = ?1, "PresentationUniqueKey" = ?2
                WHERE "Id" = ?3"#,
         )
         .bind(primary_version_id.map(guid_to_db))
-        .bind(presentation_key)
+        .bind(&presentation_key)
         .bind(guid_to_db(item_id))
-        .execute(self.db.writer())
+        .execute(&mut *tx)
         .await
         .map_err(db_err)?;
+        // 12.0 keeps the version link in `LinkedChildren` too — that is what
+        // `GetLocalAlternateVersionIds` / `GetLinkedAlternateVersions` read —
+        // so the pointer and the row move together (C# `MergeVersions` +
+        // `RefreshMetadataForVersions`): linking writes a
+        // Local(2)/LinkedAlternateVersion(3) row under the primary, unlinking
+        // removes the item's version rows.
+        sqlx::query(
+            r#"DELETE FROM "LinkedChildren" WHERE "ChildId" = ?1 AND "ChildType" IN (2, 3)"#,
+        )
+        .bind(guid_to_db(item_id))
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        if let Some(primary) = primary_version_id {
+            let child_type = alternate_version_child_type(&mut tx, item_id, primary).await?;
+            sqlx::query(
+                r#"INSERT INTO "LinkedChildren" ("ParentId", "SortOrder", "ChildId", "ChildType")
+                   VALUES (?1,
+                       (SELECT COALESCE(MAX("SortOrder"), -1) + 1
+                        FROM "LinkedChildren" WHERE "ParentId" = ?1),
+                       ?2, ?3)"#,
+            )
+            .bind(guid_to_db(primary))
+            .bind(guid_to_db(item_id))
+            .bind(child_type)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        }
+        tx.commit().await.map_err(db_err)?;
         Ok(())
     }
 
@@ -1585,6 +1636,40 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
     }
 }
 
+/// Which `LinkedChildren.ChildType` a version link gets: `LocalAlternateVersion`
+/// (2) when the two files share a directory — what 12.0's scanner writes for
+/// same-folder versions (`Video.RefreshMetadataForVersions`) — else
+/// `LinkedAlternateVersion` (3), what a manual merge writes
+/// (`VideosController.MergeVersions`).
+pub(crate) async fn alternate_version_child_type(
+    conn: &mut sqlx::SqliteConnection,
+    item_id: Uuid,
+    primary_id: Uuid,
+) -> Result<i64, ServiceError> {
+    let paths: Vec<(String, Option<String>)> =
+        sqlx::query_as(r#"SELECT "Id", "Path" FROM "BaseItems" WHERE "Id" IN (?1, ?2)"#)
+            .bind(guid_to_db(item_id))
+            .bind(guid_to_db(primary_id))
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(db_err)?;
+    let dir = |id: Uuid| {
+        paths
+            .iter()
+            .find(|(i, _)| *i == guid_to_db(id))
+            .and_then(|(_, p)| p.as_deref())
+            .map(|p| {
+                std::path::Path::new(p)
+                    .parent()
+                    .map(std::path::Path::to_path_buf)
+            })
+    };
+    Ok(match (dir(item_id), dir(primary_id)) {
+        (Some(Some(a)), Some(Some(b))) if a == b => 2,
+        _ => 3,
+    })
+}
+
 /// The full-column upsert statement for a `BaseItems` row. Column order matches
 /// the bind order in [`FerrofinItemPersistenceService::upsert_item`].
 const UPSERT_SQL: &str = r#"INSERT INTO "BaseItems" (
@@ -2163,7 +2248,7 @@ mod tests {
         assert!(!svc.item_exists(playlist).await.expect("exists p"));
         assert!(svc.item_exists(member_b).await.expect("member_b survives"));
 
-        let remaining: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM "FerrofinLinkedChildren""#)
+        let remaining: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM "LinkedChildren""#)
             .fetch_one(db.pool())
             .await
             .expect("count");
@@ -2792,6 +2877,8 @@ mod tests {
         let svc = FerrofinItemPersistenceService::new(db.clone());
         let (id, primary) = (Uuid::new_v4(), Uuid::new_v4());
         seed_item(&db, id, BaseItemKind::Episode).await;
+        // The primary must exist: the link row's ParentId is a foreign key.
+        seed_item(&db, primary, BaseItemKind::Episode).await;
         // A concurrent writer's change, landed after any caller loaded the row.
         sqlx::query(
             r#"UPDATE "BaseItems" SET "Name" = 'fresh title', "RunTimeTicks" = 42 WHERE "Id" = ?1"#,
@@ -3027,5 +3114,74 @@ mod tests {
             Some("00000000000000000000000000005e03"),
             "but a movie's key IS reproducible, so it is recomputed"
         );
+    }
+
+    /// 12.0 keeps a version group in `LinkedChildren` as well as in
+    /// `PrimaryVersionId`; the pointer and the row move together.
+    #[tokio::test]
+    async fn set_primary_version_id_writes_and_clears_the_version_link() {
+        let db = test_db().await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let (alt, primary) = (Uuid::new_v4(), Uuid::new_v4());
+        seed_item(&db, alt, BaseItemKind::Movie).await;
+        seed_item(&db, primary, BaseItemKind::Movie).await;
+        for (id, path) in [(alt, "/m/a/x.mkv"), (primary, "/m/b/x.mkv")] {
+            sqlx::query(r#"UPDATE "BaseItems" SET "Path" = ?2 WHERE "Id" = ?1"#)
+                .bind(ferrofin_db::store::guid_to_db(id))
+                .bind(path)
+                .execute(db.writer())
+                .await
+                .expect("path");
+        }
+        svc.set_primary_version_id(alt, Some(primary))
+            .await
+            .expect("link");
+        let links: Vec<(String, String, i64)> =
+            sqlx::query_as(r#"SELECT "ParentId", "ChildId", "ChildType" FROM "LinkedChildren""#)
+                .fetch_all(db.pool())
+                .await
+                .expect("links");
+        assert_eq!(
+            links,
+            vec![(
+                ferrofin_db::store::guid_to_db(primary),
+                ferrofin_db::store::guid_to_db(alt),
+                3
+            )],
+            "different directories → LinkedAlternateVersion"
+        );
+        svc.set_primary_version_id(alt, None).await.expect("unlink");
+        let count: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM "LinkedChildren""#)
+            .fetch_one(db.pool())
+            .await
+            .expect("count");
+        assert_eq!(count, 0);
+    }
+
+    /// `OwnerId` is a foreign key on the 12.0 shape: an item's extras are
+    /// deleted with it (upstream `DeleteItem` includes `GetExtras()`), never
+    /// left to trip the constraint.
+    #[tokio::test]
+    async fn delete_items_removes_owned_extras_first() {
+        let db = test_db().await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let (movie, extra) = (Uuid::new_v4(), Uuid::new_v4());
+        seed_item(&db, movie, BaseItemKind::Movie).await;
+        seed_item(&db, extra, BaseItemKind::Trailer).await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "OwnerId" = ?2, "ExtraType" = 1 WHERE "Id" = ?1"#)
+            .bind(ferrofin_db::store::guid_to_db(extra))
+            .bind(ferrofin_db::store::guid_to_db(movie))
+            .execute(db.writer())
+            .await
+            .expect("own");
+        svc.delete_items(&[movie]).await.expect("delete owner");
+        let left: i64 =
+            sqlx::query_scalar(r#"SELECT COUNT(*) FROM "BaseItems" WHERE "Id" IN (?1, ?2)"#)
+                .bind(ferrofin_db::store::guid_to_db(movie))
+                .bind(ferrofin_db::store::guid_to_db(extra))
+                .fetch_one(db.pool())
+                .await
+                .expect("count");
+        assert_eq!(left, 0);
     }
 }

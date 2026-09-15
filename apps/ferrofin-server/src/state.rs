@@ -1331,7 +1331,6 @@ pub async fn build_app_state(
         Arc::new(FerrofinPlaylistManager::new(
             db.clone(),
             Arc::clone(&library),
-            Arc::clone(&linked_children_service),
             Arc::clone(&item_repository),
             Arc::clone(&collection_paths),
         ));

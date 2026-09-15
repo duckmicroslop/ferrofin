@@ -729,6 +729,27 @@ impl Database {
         }))
     }
 
+    /// Plants an adoption record as the gate would — for tests of the boot
+    /// repairs that key on it (an in-memory database never goes through the
+    /// gate).
+    ///
+    /// # Errors
+    /// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if the write fails.
+    #[doc(hidden)]
+    pub async fn record_adoption(&self, generation: &str) -> Result<()> {
+        sqlx::query(ADOPTION_TABLE_DDL)
+            .execute(&self.writer)
+            .await?;
+        sqlx::query(
+            r#"INSERT INTO "FerrofinAdoption" ("Generation", "AdoptedAt", "MembershipImportDone")
+               VALUES (?1, CURRENT_TIMESTAMP, 0)"#,
+        )
+        .bind(generation)
+        .execute(&self.writer)
+        .await?;
+        Ok(())
+    }
+
     /// The writer-pool half of a membership import: marks the adoption
     /// record's import as done. Callers run it inside the same transaction
     /// as the imported rows via [`Self::writer`]; this convenience is for the
@@ -1595,7 +1616,7 @@ mod tests {
         "ItemValues",
         "ItemValuesMap",
         "KeyframeData",
-        "FerrofinLinkedChildren",
+        "LinkedChildren",
         "MediaSegments",
         "MediaStreamInfos",
         "PeopleBaseItemMap",
