@@ -18,6 +18,7 @@
 //!
 //! Port bootstrap semantics from `Jellyfin.Server`'s `Program.Main` + `Startup`.
 
+mod base_url;
 pub mod bootstrap;
 pub mod config;
 pub mod media_encoding;
@@ -37,7 +38,7 @@ use axum::extract::Request;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
-use axum::serve::ListenerExt as _;
+use axum::serve::{Listener as _, ListenerExt as _};
 use tower::Layer as _;
 use tower_http::services::ServeDir;
 
@@ -225,8 +226,12 @@ async fn announce_shutdown(
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     sessions: Arc<dyn ferrofin_traits::session::SessionManager>,
     signals: Signals,
+    discovery: Option<tokio::task::AbortHandle>,
 ) {
     let reason = shutdown_signal(shutdown_rx, &signals).await;
+    if let Some(discovery) = discovery {
+        discovery.abort();
+    }
     tracing::info!(reason, "graceful shutdown requested");
     let _ = sessions
         .send_message_to_all_sessions(
@@ -474,43 +479,86 @@ async fn serve_once(
     boot_stage(started, "router mounted");
     let addr = SocketAddr::new(config.bind_addr, config.port);
     let listener = bind_listener(addr).await?;
+    let bound_addr = listener.local_addr()?;
+    wired.app_host.set_bound_http_port(bound_addr.port());
+    let discovery = start_discovery(&wired, config.discovery_bind_addr).await;
+    let discovery_abort = discovery
+        .as_ref()
+        .map(tokio::task::JoinHandle::abort_handle);
     boot_stage(started, "listener bound");
     tracing::info!(%addr, "ferrofin-server listening");
 
-    serve_until_drained(
+    let serve_result = serve_until_drained(
         listener,
         router,
         announce_shutdown(
             shutdown_rx,
             Arc::clone(&wired.state.sessions),
             signals.clone(),
+            discovery_abort,
         ),
         config.shutdown_timeout_secs,
+        &config.base_url,
     )
-    .await?;
+    .await;
 
     // Tear the host down (Jellyfin: `using CoreAppHost` per iteration): stop
     // every background task, then close the pools so nothing from this lifetime
     // still holds the database file when the next one opens — or restores — it.
-    if let Some(sampler) = sampler {
-        sampler.abort();
-    }
     let restart = wired.lifecycle.restart_requested() && !signals.fired();
-    // Running scheduled tasks (a library scan, trickplay generation) are their
-    // own spawned runs holding this host's manager graph: cancel them first, as
-    // Jellyfin's host dispose does, so nothing keeps working against a pool
-    // that is about to close.
-    cancel_running_tasks(wired.state.tasks.as_ref()).await;
-    let WiredApp { background, .. } = wired;
-    for task in background {
-        task.abort();
-    }
+    tear_down_host(wired, discovery, sampler).await;
     db.close().await;
+    serve_result?;
     tracing::info!(
         uptime_s = started.elapsed().as_secs(),
         "ferrofin-server stopped"
     );
     Ok(restart)
+}
+
+/// Stops lifetime-owned services and scheduled runs before closing their database.
+async fn tear_down_host(
+    wired: WiredApp,
+    discovery: Option<tokio::task::JoinHandle<()>>,
+    sampler: Option<tokio::task::JoinHandle<()>>,
+) {
+    stop_background_tasks(discovery.into_iter().chain(sampler).collect()).await;
+    cancel_running_tasks(wired.state.tasks.as_ref()).await;
+    stop_background_tasks(wired.background).await;
+}
+
+/// Binds discovery only for an enabled server lifetime. Failure leaves HTTP up.
+async fn start_discovery(
+    wired: &WiredApp,
+    bind_addr: Option<SocketAddr>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let bind_addr = bind_addr.filter(|_| wired.discovery_enabled)?;
+    let host: Arc<dyn ferrofin_traits::system::ServerApplicationHost> = wired.app_host.clone();
+    match ferrofin_core::ServerDiscovery::bind(bind_addr, host, wired.server_id.clone()).await {
+        Ok(discovery) => {
+            tracing::info!(%bind_addr, "server discovery listening");
+            Some(tokio::spawn(discovery.run()))
+        }
+        Err(error) => {
+            tracing::error!(%error, %bind_addr, "unable to bind server discovery socket");
+            None
+        }
+    }
+}
+
+/// Aborting requests cancellation; awaiting ensures sockets and other resources
+/// have actually been dropped before the next in-process lifetime starts.
+async fn stop_background_tasks(tasks: Vec<tokio::task::JoinHandle<()>>) {
+    for task in &tasks {
+        task.abort();
+    }
+    for task in tasks {
+        if let Err(error) = task.await
+            && !error.is_cancelled()
+        {
+            tracing::error!(%error, "background task failed during shutdown");
+        }
+    }
 }
 
 /// Serves until the shutdown trigger fires and the drain completes — or
@@ -524,8 +572,11 @@ async fn serve_until_drained(
     router: axum::Router,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     timeout_secs: u32,
+    base: &str,
 ) -> anyhow::Result<()> {
     let app = axum::middleware::from_fn(canonicalize_path_case).layer(router);
+    let app = axum::middleware::from_fn_with_state(base_url::normalize(base), base_url::rewrite)
+        .layer(app);
     let (drain_started_tx, drain_started_rx) = tokio::sync::oneshot::channel::<()>();
     let serve =
         axum::serve(
@@ -926,6 +977,23 @@ mod tests {
     use ferrofin_traits::plugins::FileTransformationService;
     use std::sync::Arc;
     use tower::ServiceExt as _;
+
+    #[tokio::test]
+    async fn background_teardown_releases_sockets_before_returning() {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = socket.local_addr().expect("address");
+        let task = tokio::spawn(async move {
+            std::future::pending::<()>().await;
+            drop(socket);
+        });
+        super::stop_background_tasks(vec![task]).await;
+        let rebound = tokio::net::UdpSocket::bind(address)
+            .await
+            .expect("released before return");
+        drop(rebound);
+    }
 
     /// An upper-casing test transformer.
     struct Upper;

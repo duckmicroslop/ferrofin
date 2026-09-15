@@ -10,6 +10,7 @@ description = "Network/bind/published-URL resolution for Ferrofin (port of Jelly
 workspace = true
 
 [dependencies]
+if-addrs.workspace = true
 ferrofin-common.workspace = true
 ferrofin-model.workspace = true
 ferrofin-util.workspace = true
@@ -21,3 +22,6 @@ tracing.workspace = true
 [dev-dependencies]
 rstest.workspace = true
 serde_json.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc.workspace = true

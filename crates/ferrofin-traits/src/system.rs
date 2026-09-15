@@ -102,6 +102,12 @@ pub trait ServerApplicationHost: Send + Sync {
     /// Builds the best externally reachable API URL for a request.
     async fn get_smart_api_url(&self, request: &RequestContext) -> Result<String, ServiceError>;
 
+    /// Builds the API URL reachable by a peer, without requiring HTTP headers.
+    async fn get_smart_api_url_for_peer(
+        &self,
+        peer: std::net::IpAddr,
+    ) -> Result<String, ServiceError>;
+
     /// Builds a LAN-reachable API URL for the given host/scheme/port.
     async fn get_local_api_url(
         &self,
