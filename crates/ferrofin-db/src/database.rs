@@ -141,11 +141,12 @@ impl Database {
         if let Some(path) = &file_path {
             use sqlx::ConnectOptions;
             let mut conn = write_options.clone().foreign_keys(false).connect().await?;
+            crate::normalized_usernames::preflight(&mut conn).await?;
             adopt_jellyfin_database(&mut conn, path).await?;
             backup_before_rebuild(&mut conn, path).await?;
             let before = applied_migration_count(&mut conn).await?;
             MIGRATOR.run(&mut conn).await?;
-            crate::normalized_usernames::migrate(&mut conn).await?;
+            crate::normalized_usernames::repair(&mut conn).await?;
             if applied_migration_count(&mut conn).await? != before {
                 foreign_key_check(&mut conn).await?;
             }
@@ -241,8 +242,12 @@ impl Database {
         // to. `MIGRATOR.run` is idempotent, so this logs the target head, not
         // necessarily a newly-applied set.
         let head = MIGRATOR.iter().last().map(|m| m.version);
-        MIGRATOR.run(&self.writer).await?;
-        crate::normalized_usernames::migrate(&mut *self.writer.acquire().await?).await?;
+        {
+            let mut conn = self.writer.acquire().await?;
+            crate::normalized_usernames::preflight(&mut conn).await?;
+            MIGRATOR.run(&mut *conn).await?;
+            crate::normalized_usernames::repair(&mut conn).await?;
+        }
         tracing::info!(
             migrations = MIGRATOR.iter().count(),
             head,
@@ -832,8 +837,8 @@ const JELLYFIN_10_11_8_MIGRATIONS: [&str; 68] = [
 ];
 
 /// Known 10.11.10/10.11.11 additions over 10.11.8 (10.11.9 adds none).
-/// Their normalized username column is retained; the code migration converges
-/// older databases to the same shape and uses ICU to populate the lookup key.
+/// Their normalized username column and index are retained by baselining 0030.
+/// Older databases run 0030; the data-only ICU backfill populates lookup keys.
 const JELLYFIN_10_11_X_ADDITIVE_MIGRATIONS: [&str; 3] = [
     "20260522092303_AddNormalizedUsername",
     "20260522092304_UpdateNormalizedUsername",
@@ -856,8 +861,9 @@ const JELLYFIN_SHAPE_MIGRATION_HEAD: i64 = 7;
 /// else is refused loudly rather than half-adopted. On adoption the file
 /// is copied aside once (`<db>.pre-ferrofin`), Ferrofin's schema-shape migrations
 /// (`0001`–`0007`) are baselined into `_sqlx_migrations` without executing —
-/// the Jellyfin database already has that exact shape — and the caller's
-/// normal `MIGRATOR.run` then applies only the Ferrofin-additive tail.
+/// the Jellyfin database already has that exact shape. A complete 10.11.10/11
+/// history also baselines 0030, whose column and index it already owns.
+/// The caller runs every remaining SQL migration and the Unicode data repair.
 /// `__EFMigrationsHistory`/`__EFMigrationsLock` are never touched, so
 /// rollback requires restoring the original backup.
 async fn adopt_jellyfin_database(
@@ -889,11 +895,23 @@ async fn adopt_jellyfin_database(
         sqlx::query_scalar(r#"SELECT "MigrationId" FROM "__EFMigrationsHistory" ORDER BY 1"#)
             .fetch_all(&mut *conn)
             .await?;
-    let missing: Vec<&str> = JELLYFIN_10_11_8_MIGRATIONS
+    let mut missing: Vec<&str> = JELLYFIN_10_11_8_MIGRATIONS
         .iter()
         .filter(|e| !applied.iter().any(|a| a == *e))
         .copied()
         .collect();
+    let newer = JELLYFIN_10_11_X_ADDITIVE_MIGRATIONS
+        .iter()
+        .any(|id| applied.iter().any(|a| a == id));
+    if newer {
+        // Only complete release histories can baseline the column AND index.
+        missing.extend(
+            JELLYFIN_10_11_X_ADDITIVE_MIGRATIONS
+                .iter()
+                .filter(|id| !applied.iter().any(|a| a == *id))
+                .copied(),
+        );
+    }
     let unknown: Vec<&str> = applied
         .iter()
         .map(String::as_str)
@@ -929,7 +947,8 @@ async fn adopt_jellyfin_database(
     // Baseline the schema-shape migrations: recorded as applied, never run.
     conn.ensure_migrations_table().await?;
     for migration in MIGRATOR.iter() {
-        if migration.version > JELLYFIN_SHAPE_MIGRATION_HEAD {
+        if migration.version > JELLYFIN_SHAPE_MIGRATION_HEAD && !(newer && migration.version == 30)
+        {
             continue;
         }
         sqlx::query(
@@ -2126,6 +2145,138 @@ mod tests {
         Database::connect_sized(&url, Some(2))
             .await
             .expect("re-open after adoption");
+    }
+
+    #[rstest::rstest]
+    #[case(1)]
+    #[case(2)]
+    #[tokio::test]
+    async fn refuses_partial_normalized_username_history(#[case] additions: usize) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jellyfin.db");
+        let mut ids = JELLYFIN_10_11_8_MIGRATIONS.to_vec();
+        ids.extend(&JELLYFIN_10_11_X_ADDITIVE_MIGRATIONS[..additions]);
+        seed_jellyfin_fixture(&path, &ids).await;
+        let err = Database::connect_sized(&format!("sqlite://{}", path.display()), Some(1))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::DbError::UnsupportedJellyfinDatabase { .. }
+        ));
+        assert!(!path.with_extension("db.pre-ferrofin").exists());
+    }
+
+    #[rstest::rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn upgrading_version_29_preserves_users_and_checks_collisions(#[case] collision: bool) {
+        use sqlx::{ConnectOptions, Connection};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ferrofin.db");
+        let mut conn = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .foreign_keys(false)
+            .connect()
+            .await
+            .unwrap();
+        let old = sqlx::migrate::Migrator {
+            migrations: std::borrow::Cow::Owned(
+                MIGRATOR
+                    .iter()
+                    .filter(|m| m.version <= 29)
+                    .cloned()
+                    .collect(),
+            ),
+            ..sqlx::migrate::Migrator::DEFAULT
+        };
+        old.run(&mut conn).await.unwrap();
+        for (id, name) in [
+            ("a", "münchen"),
+            ("b", if collision { "MÜNCHEN" } else { "ı" }),
+        ] {
+            sqlx::query(r#"INSERT INTO "Users"
+                ("Id","AuthenticationProviderId","DisplayCollectionsView","DisplayMissingEpisodes",
+                 "EnableAutoLogin","EnableLocalPassword","EnableNextEpisodeAutoPlay",
+                 "EnableUserPreferenceAccess","HidePlayedInLatest","InternalId",
+                 "InvalidLoginAttemptCount","MaxActiveSessions","MustUpdatePassword",
+                 "PasswordResetProviderId","PlayDefaultAudioTrack","RememberAudioSelections",
+                 "RememberSubtitleSelections","RowVersion","SubtitleMode","SyncPlayAccess","Username","Password")
+                VALUES (?1,'auth',0,0,0,0,1,1,1,1,0,0,0,'reset',1,1,1,0,0,0,?2,'original-hash')"#)
+                .bind(id).bind(name).execute(&mut conn).await.unwrap();
+        }
+        sqlx::query(r#"INSERT INTO "Permissions" ("Kind", "RowVersion", "UserId", "Value") VALUES (0, 1, 'a', 1)"#)
+            .execute(&mut conn).await.unwrap();
+        let previous_checksums: Vec<(i64, Vec<u8>)> =
+            sqlx::query_as("SELECT version, checksum FROM _sqlx_migrations ORDER BY version")
+                .fetch_all(&mut conn)
+                .await
+                .unwrap();
+        conn.close().await.unwrap();
+        let url = format!("sqlite://{}", path.display());
+        let opened = Database::connect_sized(&url, Some(1)).await;
+        if collision {
+            assert!(matches!(
+                opened,
+                Err(crate::DbError::UsernameCollision { .. })
+            ));
+            let mut conn = SqliteConnectOptions::new()
+                .filename(&path)
+                .connect()
+                .await
+                .unwrap();
+            let applied: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+            assert_eq!(applied, 29, "collision refused before SQL migrations");
+            let column: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM pragma_table_info('Users') WHERE name = 'NormalizedUsername'",
+            )
+            .fetch_optional(&mut conn)
+            .await
+            .unwrap();
+            assert!(column.is_none());
+            return;
+        }
+        let db = opened.unwrap();
+        let checksums: Vec<(i64, Vec<u8>)> = sqlx::query_as(
+            "SELECT version, checksum FROM _sqlx_migrations WHERE version <= 29 ORDER BY version",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(checksums, previous_checksums);
+        let rows: Vec<(String, String, String)> =
+            sqlx::query_as("SELECT Id, NormalizedUsername, Password FROM Users ORDER BY Id")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            [
+                ("a".into(), "MÜNCHEN".into(), "original-hash".into()),
+                ("b".into(), "ı".into(), "original-hash".into())
+            ]
+        );
+        let permissions: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM Permissions WHERE UserId = 'a' AND Value = 1")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(permissions, 1);
+        let applied: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 30 AND success",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(applied, 1);
+        db.close().await;
+        let reopened = Database::connect_sized(&url, Some(1)).await.unwrap();
+        reopened.run_migrations().await.unwrap();
     }
 
     #[tokio::test]

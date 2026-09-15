@@ -10,11 +10,19 @@ major-version upgrade.
 
 ## Unreleased — Unicode username matching
 
-An automatic, transactional code migration adds or retains `Users.NormalizedUsername`,
-populates ICU-based invariant uppercase keys, and enforces a unique index. It runs after
-the SQL migrations and before the database is exposed to requests; completion is recorded
-as `normalized_usernames_icu_v1` in `FerrofinMeta`. Existing SQL migration checksums are
-unchanged. Account IDs, password hashes, permissions, and watch history are preserved.
+Migration `0030_normalized_usernames.sql` owns the `Users.NormalizedUsername` column
+and unique index. Older databases run it; adopted Jellyfin 10.11.10/10.11.11 databases
+baseline it because they already have those schema objects. Migrations 0001–0029 remain
+unchanged. A Rust data-only backfill then writes ICU-based invariant uppercase keys,
+recording completion as `normalized_usernames_icu_v1` in `FerrofinMeta` in the same
+transaction. It never adds a column or drops/recreates an index.
+
+SQL initially copies the existing unique display names into the keys, so it does not
+rely on SQLite's ASCII-only `upper()`. Startup checks for Unicode collisions before
+running SQL migrations, and the backfill validates again inside its transaction.
+No requests are served until the backfill succeeds. Account IDs, password hashes,
+permissions, and watch history are preserved. A failed backfill can retry on the next
+startup without reapplying SQL migrations.
 
 Login, creation, and renaming now agree for non-ASCII case variants such as `münchen`
 and `MÜNCHEN`. If old accounts normalize to the same key, startup refuses with their IDs

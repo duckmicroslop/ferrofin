@@ -1,12 +1,8 @@
-//! Schema-equality gate: a fresh Ferrofin database's Jellyfin-owned schema must
-//! match Jellyfin 10.11.8 plus the 10.11.10 username additions.
-//!
-//! The fixture (`tests/data/jellyfin-10.11.8-schema.sql`) is the sqlite_master
-//! dump of a database created by a real `jellyfin/jellyfin:10.11.8` server —
-//! the drop-in contract. This
-//! test is the tripwire for future drift: any schema change that breaks
-//! parity with the fixture plus the explicit username additions fails here, and the future Jellyfin-12 sync will
-//! be gated on an updated fixture the same way.
+//! Schema-equality gate against the pinned Jellyfin 10.11.11 reference.
+//! The fixture documents its derivation from the captured 10.11.8 schema and
+//! the two upstream 10.11.10 additions. Both the raw SQL migration chain and
+//! the served database must produce this same schema; the Rust data repair
+//! must not create, drop, or alter any schema objects.
 //!
 //! Comparison rules:
 //! - tables: names, columns (declared type, notnull, default, pk position),
@@ -111,23 +107,20 @@ async fn snapshot(pool: &SqlitePool) -> (BTreeMap<String, TableShape>, BTreeSet<
 }
 
 #[tokio::test]
-async fn fresh_schema_equals_jellyfin_with_normalized_usernames() {
-    // The real 10.11.8 schema, from the committed fixture dump.
+async fn sql_chain_and_served_schema_equal_jellyfin_10_11_11() {
+    // The independently pinned upstream reference, without Ferrofin migrations.
     let jellyfin = Database::connect_in_memory().await.expect("jf connect");
-    sqlx::raw_sql(include_str!("data/jellyfin-10.11.8-schema.sql"))
+    sqlx::raw_sql(include_str!("data/jellyfin-10.11.11-schema.sql"))
         .execute(jellyfin.pool())
         .await
         .expect("apply fixture schema");
 
-    // The two schema additions shipped by Jellyfin 10.11.10. Keep the
-    // independent 10.11.8 fixture unchanged and compare the exact new shape.
-    sqlx::raw_sql(
-        r#"ALTER TABLE "Users" ADD COLUMN "NormalizedUsername" TEXT NOT NULL DEFAULT '';
-        CREATE UNIQUE INDEX "IX_Users_NormalizedUsername" ON "Users" ("NormalizedUsername");"#,
-    )
-    .execute(jellyfin.pool())
-    .await
-    .expect("10.11.10 additions");
+    // No code backfill: the SQL migration chain alone must own the full schema.
+    let sql_only = Database::connect_in_memory().await.expect("SQL connect");
+    sqlx::migrate!("./migrations")
+        .run(sql_only.pool())
+        .await
+        .expect("SQL chain");
 
     // A fresh Ferrofin database through the full migration chain.
     let ferrofin = Database::connect_in_memory()
@@ -137,6 +130,11 @@ async fn fresh_schema_equals_jellyfin_with_normalized_usernames() {
 
     let (jf_tables, jf_indexes) = snapshot(jellyfin.pool()).await;
     let (hm_tables, hm_indexes) = snapshot(ferrofin.pool()).await;
+    assert_eq!(
+        snapshot(sql_only.pool()).await,
+        snapshot(ferrofin.pool()).await,
+        "Rust backfill must not alter the schema produced by SQL migrations"
+    );
 
     let jf_names: BTreeSet<_> = jf_tables.keys().collect();
     let hm_names: BTreeSet<_> = hm_tables.keys().collect();
@@ -149,7 +147,7 @@ async fn fresh_schema_equals_jellyfin_with_normalized_usernames() {
         let hm_shape = &hm_tables[name];
         assert_eq!(
             jf_shape.columns, hm_shape.columns,
-            "column shape of `{name}` diverges from 10.11.8"
+            "column shape of `{name}` diverges from 10.11.11"
         );
         assert_eq!(
             jf_shape.foreign_keys, hm_shape.foreign_keys,
@@ -160,7 +158,7 @@ async fn fresh_schema_equals_jellyfin_with_normalized_usernames() {
     let missing: Vec<_> = jf_indexes.difference(&hm_indexes).collect();
     assert!(
         missing.is_empty(),
-        "10.11.8 indexes missing from Ferrofin: {missing:?}"
+        "10.11.11 indexes missing from Ferrofin: {missing:?}"
     );
     let extra: Vec<_> = hm_indexes
         .difference(&jf_indexes)
