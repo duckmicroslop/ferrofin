@@ -34,7 +34,7 @@ the server is Rust. Point Ferrofin at an existing Jellyfin database and it adopt
   runtime, no JIT warm-up. The Docker image bundles both jellyfin-ffmpeg and the jellyfin-web
   client, so `docker run` gives you the whole server, web UI included.
 - **Drop-in compatible.** Same API contract, same on-disk database format (pinned to
-  Jellyfin 10.11.8), same password hashes. Adopt an existing library with no re-scan.
+  Jellyfin 12.0), same password hashes. Adopt an existing Jellyfin 10.11.8 or 12.0 library with no re-scan.
 - **Plugins cannot own your server.** Jellyfin loads plugins as full-trust .NET code inside
   the server process. Ferrofin does not, and will not. Third-party plugins run as
   sandboxed WASM with no filesystem or network access of their own. This is the one place
@@ -140,7 +140,7 @@ Configuration is via CLI flags, `FERROFIN_*` environment variables, or
 ## Migrating from Jellyfin
 
 Ferrofin reads Jellyfin's database directly. Point it at a data directory containing a
-Jellyfin 10.11.8 `jellyfin.db` and on first boot it detects the database, validates its
+Jellyfin **10.11.8** or **12.0** `jellyfin.db` and on first boot it detects the database, validates its
 migration set (and refuses loudly rather than half-adopting an unexpected version), and
 adopts it in place: **no re-scan, no re-import**. Users, watch state, playlists, and Live TV
 configuration carry forward.

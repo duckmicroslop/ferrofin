@@ -8,6 +8,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com) and
 Upgrades needing a manual step or with a non-obvious behavior change are
 called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 
+## [Unreleased]
+
+### Database
+- Converge the schema on Jellyfin 12.0 (migrations 0030–0032): table rebuilds with a
+  pre-rebuild snapshot, 12.0's index set, `LinkedChildren` as the only membership store
+- Adopt Jellyfin 12.0 databases in place alongside 10.11.8 (exact migration sets; an
+  atomic adoption record drives the one-shot membership import)
+- Run `PRAGMA foreign_key_check` on every boot, not only after a migration
+
+### Parity
+- Port Jellyfin 12.0's data routines: linked-children move, orphaned extras, OwnerId
+  relationships, version links, `GetCleanValue`, forced sort names, localized user-view
+  consolidation
+
 ## [1.0.0] - 2026-09-05
 
 ### CI/CD
