@@ -15,6 +15,7 @@ thiserror.workspace = true
 rand = "0.8"
 unicode-normalization = "0.1"
 regex.workspace = true
+icu_casemap.workspace = true
 
 [dev-dependencies]
 rstest.workspace = true

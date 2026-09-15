@@ -1,11 +1,11 @@
 //! Schema-equality gate: a fresh Ferrofin database's Jellyfin-owned schema must
-//! be IDENTICAL to a real Jellyfin 10.11.8 database's.
+//! match Jellyfin 10.11.8 plus the 10.11.10 username additions.
 //!
 //! The fixture (`tests/data/jellyfin-10.11.8-schema.sql`) is the sqlite_master
 //! dump of a database created by a real `jellyfin/jellyfin:10.11.8` server —
 //! the drop-in contract. This
 //! test is the tripwire for future drift: any schema change that breaks
-//! byte-parity with 10.11.8 fails here, and the future Jellyfin-12 sync will
+//! parity with the fixture plus the explicit username additions fails here, and the future Jellyfin-12 sync will
 //! be gated on an updated fixture the same way.
 //!
 //! Comparison rules:
@@ -111,13 +111,23 @@ async fn snapshot(pool: &SqlitePool) -> (BTreeMap<String, TableShape>, BTreeSet<
 }
 
 #[tokio::test]
-async fn fresh_ferrofin_schema_equals_real_jellyfin_10_11_8() {
+async fn fresh_schema_equals_jellyfin_with_normalized_usernames() {
     // The real 10.11.8 schema, from the committed fixture dump.
     let jellyfin = Database::connect_in_memory().await.expect("jf connect");
     sqlx::raw_sql(include_str!("data/jellyfin-10.11.8-schema.sql"))
         .execute(jellyfin.pool())
         .await
         .expect("apply fixture schema");
+
+    // The two schema additions shipped by Jellyfin 10.11.10. Keep the
+    // independent 10.11.8 fixture unchanged and compare the exact new shape.
+    sqlx::raw_sql(
+        r#"ALTER TABLE "Users" ADD COLUMN "NormalizedUsername" TEXT NOT NULL DEFAULT '';
+        CREATE UNIQUE INDEX "IX_Users_NormalizedUsername" ON "Users" ("NormalizedUsername");"#,
+    )
+    .execute(jellyfin.pool())
+    .await
+    .expect("10.11.10 additions");
 
     // A fresh Ferrofin database through the full migration chain.
     let ferrofin = Database::connect_in_memory()
