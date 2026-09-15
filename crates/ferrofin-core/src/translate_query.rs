@@ -26,6 +26,8 @@
 //! identity binds use [`guid_to_db`] and datetime binds use [`datetime_to_db`]
 //! — byte-identical to Jellyfin-written rows under SQLite `BINARY` collation.
 
+use ferrofin_util::string_extensions::{lower_invariant, upper_invariant};
+
 use ferrofin_db::enums::ItemValueType;
 use ferrofin_db::store::{datetime_to_db, guid_to_db};
 use ferrofin_model::data::BaseItemKind;
@@ -449,10 +451,10 @@ pub(crate) fn append_predicates<'a>(
 
     if let Some(term) = non_blank(filter.search_term.as_ref()) {
         let like = format!("%{}%", get_clean_value(term).trim_matches('%'));
-        let orig_like = format!("%{term}%");
+        let orig_like = format!("%{}%", lower_invariant(term));
         qb.push(r#" AND (bi."CleanName" LIKE "#)
             .push_bind(like)
-            .push(r#" OR (bi."OriginalTitle" IS NOT NULL AND bi."OriginalTitle" LIKE "#)
+            .push(r#" OR (bi."OriginalTitle" IS NOT NULL AND ferrofin_lower_invariant(bi."OriginalTitle") LIKE "#)
             .push_bind(orig_like)
             .push("))");
     }
@@ -910,8 +912,8 @@ fn append_name_predicates(
 ) {
     if let Some(name) = non_blank(filter.name.as_ref()) {
         if filter.use_raw_name == Some(true) {
-            qb.push(r#" AND lower(bi."Name") = "#)
-                .push_bind(name.to_lowercase());
+            qb.push(r#" AND ferrofin_lower_invariant(bi."Name") = "#)
+                .push_bind(lower_invariant(name));
         } else {
             qb.push(r#" AND bi."CleanName" = "#)
                 .push_bind(get_clean_value(name));
@@ -939,23 +941,23 @@ fn append_name_predicates(
         let clean = format!("%{}%", get_clean_value(contains).trim_matches('%'));
         qb.push(r#" AND (bi."CleanName" LIKE "#)
             .push_bind(clean.clone())
-            .push(r#" OR bi."OriginalTitle" LIKE "#)
-            .push_bind(clean)
+            .push(r#" OR ferrofin_lower_invariant(bi."OriginalTitle") LIKE "#)
+            .push_bind(format!("%{}%", lower_invariant(contains).trim_matches('%')))
             .push(")");
     }
 
     // NameStartsWith* / NameLessThan compare on SortName (C# ApplyNameFilters).
     if let Some(prefix) = non_blank(filter.name_starts_with.as_ref()) {
-        qb.push(r#" AND lower(bi."SortName") LIKE "#)
-            .push_bind(format!("{}%", prefix.to_lowercase()));
+        qb.push(r#" AND ferrofin_upper_invariant(bi."SortName") LIKE "#)
+            .push_bind(format!("{}%", upper_invariant(prefix)));
     }
     if let Some(bound) = non_blank(filter.name_starts_with_or_greater.as_ref()) {
-        qb.push(r#" AND lower(bi."SortName") >= "#)
-            .push_bind(bound.to_lowercase());
+        qb.push(r#" AND ferrofin_lower_invariant(bi."SortName") >= "#)
+            .push_bind(lower_invariant(bound));
     }
     if let Some(bound) = non_blank(filter.name_less_than.as_ref()) {
-        qb.push(r#" AND lower(bi."SortName") < "#)
-            .push_bind(bound.to_lowercase());
+        qb.push(r#" AND ferrofin_lower_invariant(bi."SortName") < "#)
+            .push_bind(lower_invariant(bound));
     }
 }
 

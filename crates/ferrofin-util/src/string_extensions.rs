@@ -206,7 +206,7 @@ pub fn get_clean_value(value: &str) -> String {
     if value.trim().is_empty() {
         return value.to_owned();
     }
-    remove_diacritics(value).to_lowercase()
+    lower_invariant(&remove_diacritics(value))
 }
 
 /// `string.Equals(a, b, StringComparison.OrdinalIgnoreCase)`.
@@ -227,12 +227,18 @@ pub fn equals_ordinal_ignore_case(left: &str, right: &str) -> bool {
 /// .NET invariant uppercase for a string, using ICU's simple mappings.
 #[must_use]
 pub fn upper_invariant(text: &str) -> String {
+    if text.is_ascii() {
+        return text.to_ascii_uppercase();
+    }
     text.chars().map(to_upper_invariant).collect()
 }
 
 /// .NET invariant lowercase for a string, using ICU's simple mappings.
 #[must_use]
 pub fn lower_invariant(text: &str) -> String {
+    if text.is_ascii() {
+        return text.to_ascii_lowercase();
+    }
     let mapper = icu_casemap::CaseMapper::new();
     text.chars()
         // .NET ChangeCaseInvariant preserves capital dotted I.
@@ -441,6 +447,8 @@ mod tests {
     #[case("", "")] // whitespace/empty passes through unchanged
     #[case("   ", "   ")] // all-whitespace passes through unchanged
     #[case("Béla   Tarr!!", "bela   tarr!!")] // fold + lowercase, nothing else
+    #[case("ΟΣ", "οσ")] // simple casing does not apply final-sigma context
+    #[case("𐐀", "𐐨")]
     #[case("A,B;C", "a,b;c")] // punctuation survives
     // Read verbatim out of a real Jellyfin 10.11.8 database.
     #[case("H. Jon Benjamin", "h. jon benjamin")]

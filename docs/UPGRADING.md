@@ -41,3 +41,17 @@ pre-1.0 development builds were never published and are not an upgrade path.
 [Migrating from Jellyfin](../README.md#migrating-from-jellyfin): adoption is one-way,
 Ferrofin writes `jellyfin.db.pre-ferrofin` before touching anything, and you should back
 up the whole Jellyfin data directory yourself first.
+
+## Unicode metadata casing
+
+Migration `0031_invariant_clean_names` corrects clean-name and derived sort keys
+that match Ferrofin's previous full-lowercase mapping. It preserves item IDs,
+references, raw names, custom keys, and the original forced sort-title text.
+New Jellyfin-mode by-name IDs use .NET-compatible invariant casing; existing
+person IDs and year IDs under affected Unicode metadata roots remain in use.
+
+Apply this migration by starting Ferrofin. It uses application-provided Unicode
+functions that standalone `sqlite3` and `sqlx migrate` do not register. No
+persistent schema objects depend on these functions, so external database
+inspection remains possible after migration. Follow the backup and rollback
+steps above before upgrading.

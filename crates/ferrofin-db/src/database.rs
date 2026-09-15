@@ -1218,6 +1218,7 @@ fn configure_sqlite_for_concurrency() {
         // auto-extension initializes SQLite, and `sqlite3_config` is refused
         // once that has happened.
         crate::sqlite_random::register_random_function();
+        crate::sqlite_casing::register();
     });
 }
 
