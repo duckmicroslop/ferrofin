@@ -39,8 +39,9 @@ Behaviour that changed with the shape:
   `.m3u` next to an album — has no Playlists view on the home screen; the playlists themselves
   are unchanged and still found by search and `/Items`.
 - Alternate-version groups are re-derived once from `LinkedChildren` (Jellyfin 12.1's
-  `RepairAlternateVersionLinks`): an item marked as a version of a row that no longer exists
-  becomes a primary again and reappears in listings. A 12.0 database keeps its `LinkedChildren` rows and
+  `RepairAlternateVersionLinks`), and a version is hidden only while its primary exists in the
+  same library: an item marked as a version of a row that no longer exists reappears in
+  listings (144 episodes on the reference library), exactly as on Jellyfin 12.1. A 12.0 database keeps its `LinkedChildren` rows and
   is never re-imported from the frozen JSON copy in `Data`.
 
 ## Unreleased — Unicode username matching

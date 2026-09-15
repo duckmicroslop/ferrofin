@@ -30,8 +30,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - Port Jellyfin 12.1's routines and rules: `RepairAlternateVersionLinks` (primaries re-derived
   from `LinkedChildren`), `StripEmbeddedLinkedChildren`, the re-dated rating-level pass with
   12.1's `GetRatingScore` (whole value first, unrated parts skipped, case-insensitive tables),
-  the user-view consolidation's reference moves, and `HasVisibleChild` (a playlists or
-  boxsets library with nothing the user can see has no view)
+  the user-view consolidation's reference moves, `HasVisibleChild` (a playlists or boxsets
+  library with nothing the user can see has no view), and `ApplyAlternateVersionFiltering` (a
+  version is hidden only behind a primary that exists in the same library)
 
 ## [1.0.0] - 2026-09-05
 

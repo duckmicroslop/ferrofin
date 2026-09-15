@@ -45,6 +45,10 @@ use ferrofin_traits::options::InternalItemsQuery;
 /// excludes it (C# `PlaceholderId`).
 pub(crate) const PLACEHOLDER_ID: &str = "00000000-0000-0000-0000-000000000001";
 
+/// 12.1 `ApplyAlternateVersionFiltering`: keep a row unless it is a version
+/// of a primary that still exists in the same library.
+const ALTERNATE_VERSION_HIDDEN: &str = r#" AND (bi."PrimaryVersionId" IS NULL OR NOT EXISTS (SELECT 1 FROM "BaseItems" p WHERE p."Id" = bi."PrimaryVersionId" AND p."TopParentId" IS bi."TopParentId"))"#;
+
 /// The "unowned" predicate. C# treats `OwnerId = Guid.Empty` as "no owner": a
 /// real Jellyfin database stores the ZERO GUID on virtually every row
 /// (adopted-DB evidence), while Ferrofin's writer leaves the column NULL — every
@@ -644,18 +648,22 @@ pub(crate) fn append_predicates<'a>(
         && !filter.include_owned_items
     {
         // Exclude alternate versions + owned non-extra items from general
-        // queries — 12.0 `TranslateQuery.cs:806-815`, statement for statement:
-        // a resume query keeps the alternates so the version that was actually
-        // played surfaces instead of collapsing onto the primary; every other
-        // query hides every row with a `PrimaryVersionId`, including one whose
-        // primary no longer exists (12.0's own cleanup routines, not the
-        // query, are what remove those).
+        // queries — 12.1 `BaseItemRepository.ApplyAlternateVersionFiltering`:
+        // a row is hidden only while its primary exists *in the same library*
+        // (`TopParentId`), so a version whose primary is gone, or was moved to
+        // another library, is listed again as an item of its own. (12.0 hid
+        // every row with a `PrimaryVersionId`; on the owner's library that was
+        // 144 episodes.) A resume query keeps the alternates so the version
+        // that was actually played surfaces instead of collapsing onto the
+        // primary. The subquery is a primary-key probe per candidate row, and
+        // `IS` keeps EF's null-equal semantics for two library-less rows.
         if filter.is_resumable == Some(true) {
             qb.push(" AND (")
                 .push(NO_OWNER)
                 .push(r#" OR bi."ExtraType" IS NOT NULL)"#);
         } else {
-            qb.push(r#" AND bi."PrimaryVersionId" IS NULL AND ("#)
+            qb.push(ALTERNATE_VERSION_HIDDEN)
+                .push(" AND (")
                 .push(NO_OWNER)
                 .push(r#" OR bi."ExtraType" IS NOT NULL)"#);
         }

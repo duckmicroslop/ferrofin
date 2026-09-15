@@ -1019,6 +1019,50 @@ async fn id_list_queries_are_driven_by_the_primary_key_not_the_type_index() {
     }
 }
 
+/// 12.1 `ApplyAlternateVersionFiltering`: a version is hidden only while its
+/// primary exists in the same library. A version whose primary row is gone,
+/// or lives in another library, is an item of its own again (12.0 hid every
+/// row with a `PrimaryVersionId`; on the owner's library that was 144
+/// episodes that Jellyfin 12.1 lists and 12.0 did not).
+#[tokio::test]
+async fn a_version_is_hidden_only_behind_a_primary_in_the_same_library() {
+    let db = fresh_db().await;
+    let persist = FerrofinItemPersistenceService::new(db.clone());
+    let (lib_a, lib_b) = (Uuid::from_u128(0xA), Uuid::from_u128(0xB));
+    let mut primary = item(Uuid::from_u128(0x81), BaseItemKind::Movie, "Primary");
+    primary.top_parent_id = Some(lib_a.to_string());
+    let mut same_library = item(Uuid::from_u128(0x82), BaseItemKind::Movie, "Hidden version");
+    same_library.top_parent_id = Some(lib_a.to_string());
+    same_library.primary_version_id = Some(primary.id.clone());
+    let mut other_library = item(Uuid::from_u128(0x83), BaseItemKind::Movie, "Moved version");
+    other_library.top_parent_id = Some(lib_b.to_string());
+    other_library.primary_version_id = Some(primary.id.clone());
+    let mut orphan = item(Uuid::from_u128(0x84), BaseItemKind::Movie, "Orphan version");
+    orphan.top_parent_id = Some(lib_a.to_string());
+    orphan.primary_version_id = Some(Uuid::from_u128(0x99).to_string());
+    persist
+        .save_items(&[primary, same_library, other_library, orphan])
+        .await
+        .expect("save");
+
+    let mut names: Vec<String> = repo(&db)
+        .get_item_list(&InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::Movie],
+            ..InternalItemsQuery::default()
+        })
+        .await
+        .expect("query")
+        .into_iter()
+        .filter_map(|row| row.name)
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["Moved version", "Orphan version", "Primary"],
+        "only the version behind a same-library primary is hidden"
+    );
+}
+
 /// A collection created the way a user creates one stays visible to that user.
 ///
 /// A query naming no scope is confined to the user's libraries (C#
