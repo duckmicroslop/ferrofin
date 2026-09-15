@@ -973,6 +973,52 @@ async fn sort_name_browse_uses_the_index_and_the_pinned_shapes_do_not() {
     }
 }
 
+/// Since the 12.0 schema (migration 0030) no index leads with `Id` and `Type`
+/// together, and a lone `Type` equality ties with the `Id` primary key in the
+/// planner's costing — and wins, turning an id-list lookup into a scan of every
+/// row of that type. Each id-list query therefore writes the type column as
+/// `+"Type"`; this pins the plans so a dropped `+` shows up here rather than as
+/// a +60 % p50 on `detail:similar` in the benchmark.
+#[tokio::test]
+async fn id_list_queries_are_driven_by_the_primary_key_not_the_type_index() {
+    const PK: &str = "sqlite_autoindex_BaseItems_1 (Id=?)";
+
+    let db = fresh_db().await;
+    let persist = FerrofinItemPersistenceService::new(db.clone());
+    persist
+        .save_items(&[item(Uuid::from_u128(0x71), BaseItemKind::Movie, "Stalker")])
+        .await
+        .expect("save");
+
+    // The unpinned shape is the trap: the same statement takes a Type index.
+    let trap = plan(
+        &db,
+        r#"SELECT "Id", "Data" FROM "BaseItems" WHERE "Data" IS NOT NULL AND "Type" = ? AND "Id" IN (?, ?, ?)"#,
+    )
+    .await;
+    assert!(
+        trap.contains("(Type=?)") && !trap.contains(PK),
+        "the pin exists because the planner prefers the Type index here, got: {trap}"
+    );
+
+    for sql in [
+        // item_repository::physical_folders_by_view
+        r#"SELECT "Id", "Data" FROM "BaseItems" WHERE "Data" IS NOT NULL AND +"Type" = ? AND "Id" IN (?, ?, ?)"#,
+        // item_repository::item_text_rows
+        r#"SELECT "Id", "Name" FROM "BaseItems" WHERE "Id" IN (?, ?, ?) AND +"Type" = ?4"#,
+        // translate_query::append_type_filters with an `Ids` list
+        r#"SELECT bi.* FROM "BaseItems" AS bi WHERE bi."Id" IN (?, ?, ?) AND +bi."Type" IN (?) AND bi."PrimaryVersionId" IS NULL ORDER BY bi."SortName""#,
+        // similar_items_repository: the scored candidate set joins through the key
+        r#"SELECT bi.* FROM (SELECT ivm2."ItemId" AS id, COUNT(*) AS score FROM "ItemValuesMap" ivm0 JOIN "ItemValuesMap" ivm2 ON ivm2."ItemValueId" = ivm0."ItemValueId" WHERE ivm0."ItemId" = ?1 GROUP BY ivm2."ItemId") s JOIN "BaseItems" bi ON bi."Id" = s.id WHERE +bi."Type" IN (?2, ?3) AND bi."Id" NOT IN (?4) ORDER BY s.score DESC, bi."SortName" ASC, bi."Id" ASC LIMIT ?5"#,
+    ] {
+        let pinned = plan(&db, sql).await;
+        assert!(
+            pinned.contains(PK) && !pinned.contains("AUTOMATIC") && !pinned.contains("(Type=?)"),
+            "an id-list query must be driven by the primary key, got: {pinned}\n  for: {sql}"
+        );
+    }
+}
+
 /// A collection created the way a user creates one stays visible to that user.
 ///
 /// A query naming no scope is confined to the user's libraries (C#

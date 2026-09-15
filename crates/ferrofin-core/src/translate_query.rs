@@ -803,7 +803,20 @@ fn append_resolution_predicate(qb: &mut QueryBuilder<'_, Sqlite>, filter: &Inter
 }
 
 /// Appends `IncludeItemTypes` / `ExcludeItemTypes` as `Type` in/not-in lists.
+///
+/// With an `Ids` list in the query the `Type` column is written `+bi."Type"`
+/// so no `Type`-led index can serve it: 12.0 dropped
+/// `IX_BaseItems_Id_Type_IsFolder_IsVirtualItem`, and without it a single
+/// `Type` equality ties with the `Id` primary key in the planner's costing and
+/// wins — a scan of every row of that type (3,001 movies on the bench corpus)
+/// instead of a handful of key lookups. The `Ids` list is always the selective
+/// side, so the pin loses nothing.
 fn append_type_filters<'a>(qb: &mut QueryBuilder<'a, Sqlite>, filter: &'a InternalItemsQuery) {
+    let column = if filter.item_ids.is_empty() {
+        r#"bi."Type""#
+    } else {
+        r#"+bi."Type""#
+    };
     if filter.include_item_types.is_empty() {
         let excludes: Vec<String> = filter
             .exclude_item_types
@@ -813,7 +826,7 @@ fn append_type_filters<'a>(qb: &mut QueryBuilder<'a, Sqlite>, filter: &'a Intern
             .collect();
         if !excludes.is_empty() {
             qb.push(" AND NOT ");
-            push_in_list(qb, r#"bi."Type""#, &excludes);
+            push_in_list(qb, column, &excludes);
         }
     } else {
         let includes: Vec<String> = filter
@@ -823,7 +836,7 @@ fn append_type_filters<'a>(qb: &mut QueryBuilder<'a, Sqlite>, filter: &'a Intern
             .map(ToOwned::to_owned)
             .collect();
         qb.push(" AND ");
-        push_in_list(qb, r#"bi."Type""#, &includes);
+        push_in_list(qb, column, &includes);
     }
 }
 
@@ -2136,6 +2149,40 @@ mod tests {
                 r#" ORDER BY bi."DateCreated" DESC, bi."Id" DESC LIMIT ?"#,
             ),
             "the album query carries no track predicate, no caller ordering and no offset"
+        );
+    }
+
+    /// An `Ids` list makes the type predicate `+bi."Type"` (planner pin: the
+    /// key lookups must drive the query, not a `Type` index — see
+    /// `append_type_filters`); without one the column stays indexable.
+    #[test]
+    fn an_id_list_pins_the_type_predicate_off_the_index() {
+        let with_ids = build_query(
+            &InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::Movie],
+                item_ids: vec![uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2)],
+                ..InternalItemsQuery::default()
+            },
+            QueryShape::FullRows,
+        )
+        .into_sql();
+        assert!(
+            with_ids.contains(r#"AND +bi."Type" IN (?)"#)
+                && with_ids.contains(r#"bi."Id" IN (?, ?)"#),
+            "{with_ids}"
+        );
+
+        let without = build_query(
+            &InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::Movie],
+                ..InternalItemsQuery::default()
+            },
+            QueryShape::FullRows,
+        )
+        .into_sql();
+        assert!(
+            without.contains(r#"AND bi."Type" IN (?)"#) && !without.contains(r#"+bi."Type""#),
+            "{without}"
         );
     }
 

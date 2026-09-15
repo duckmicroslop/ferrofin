@@ -1461,7 +1461,8 @@ pub(crate) async fn physical_folders_by_view(
         return Ok(HashMap::new());
     };
     let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
-        r#"SELECT "Id", "Data" FROM "BaseItems" WHERE "Data" IS NOT NULL AND "Type" = "#,
+        // `+"Type"`: the id list is the selective side; see `append_type_filters`.
+        r#"SELECT "Id", "Data" FROM "BaseItems" WHERE "Data" IS NOT NULL AND +"Type" = "#,
     );
     qb.push_bind(collection_folder).push(" AND ");
     push_in_list(&mut qb, r#""Id""#, &to_guid_strings(ids));
@@ -1959,7 +1960,7 @@ impl ItemRepository for FerrofinItemRepository {
             // past the bound arguments and the query silently matches nothing.
             let sql = format!(
                 r#"SELECT "Id", "Name", "SortName", "Overview", "Path"
-                   FROM "BaseItems" WHERE "Id" IN ({}) AND "Type" = ?{}"#,
+                   FROM "BaseItems" WHERE "Id" IN ({}) AND +"Type" = ?{}"#,
                 placeholders(chunk.len()),
                 chunk.len() + 1
             );

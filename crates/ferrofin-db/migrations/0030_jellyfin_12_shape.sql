@@ -389,66 +389,20 @@ CREATE INDEX "IX_BaseItems_Type_TopParentId_StartDate" ON "BaseItems"(
   "TopParentId",
   "StartDate"
 );
-CREATE INDEX "FerrofinIX_BaseItems_ExtraType_OwnerId" ON "BaseItems"(
-  "ExtraType",
-  "OwnerId"
-);
+-- Ferrofin's own BaseItems indexes: only the two shapes 12.0 does not ship.
+-- The other fourteen `FerrofinIX_BaseItems_*` indexes of 0014/0018 are
+-- column-for-column (and WHERE-for-WHERE) duplicates of the `IX_BaseItems_*`
+-- set 12.0 added above; a duplicate index changes no plan and doubles the
+-- write cost, so they are not recreated here.
 CREATE INDEX "FerrofinIX_BaseItems_IsLocked"
 ON "BaseItems"(
   "IsLocked"
 )
 WHERE "IsLocked" = 1;
-CREATE INDEX "FerrofinIX_BaseItems_Name" ON "BaseItems"("Name");
-CREATE INDEX "FerrofinIX_BaseItems_OwnerId" ON "BaseItems"("OwnerId");
-CREATE INDEX "FerrofinIX_BaseItems_PrimaryVersionId" ON "BaseItems"(
-  "PrimaryVersionId"
-) WHERE "PrimaryVersionId" IS NOT NULL;
-CREATE INDEX "FerrofinIX_BaseItems_SeasonId" ON "BaseItems"("SeasonId");
-CREATE INDEX "FerrofinIX_BaseItems_SeriesId" ON "BaseItems"("SeriesId");
-CREATE INDEX "FerrofinIX_BaseItems_SeriesName" ON "BaseItems"("SeriesName");
 CREATE INDEX "FerrofinIX_BaseItems_SortName_Name"
 ON "BaseItems"(
   "SortName",
   "Name"
-);
-CREATE INDEX "FerrofinIX_BaseItems_TopParentId_IsFolder_IsVirtualItem_DateCreated" ON "BaseItems"(
-  "TopParentId",
-  "IsFolder",
-  "IsVirtualItem",
-  "DateCreated"
-);
-CREATE INDEX "FerrofinIX_BaseItems_TopParentId_MediaType_IsVirtualItem_DateCreated" ON "BaseItems"(
-  "TopParentId",
-  "MediaType",
-  "IsVirtualItem",
-  "DateCreated"
-);
-CREATE INDEX "FerrofinIX_BaseItems_TopParentId_Type_IsVirtualItem" ON "BaseItems"(
-  "TopParentId",
-  "Type",
-  "IsVirtualItem"
-) WHERE "PrimaryVersionId" IS NULL 
-    AND("OwnerId" IS NULL OR "ExtraType" IS NOT NULL);
-CREATE INDEX "FerrofinIX_BaseItems_TopParentId_Type_IsVirtualItem_DateCreated" ON "BaseItems"(
-  "TopParentId",
-  "Type",
-  "IsVirtualItem",
-  "DateCreated"
-);
-CREATE INDEX "FerrofinIX_BaseItems_Type_CleanName" ON "BaseItems"(
-  "Type",
-  "CleanName"
-);
-CREATE INDEX "FerrofinIX_BaseItems_Type_SeriesPresentationUniqueKey_ParentIndexNumber_IndexNumber" ON "BaseItems"(
-  "Type",
-  "SeriesPresentationUniqueKey",
-  "ParentIndexNumber",
-  "IndexNumber"
-);
-CREATE INDEX "FerrofinIX_BaseItems_Type_TopParentId_SortName" ON "BaseItems"(
-  "Type",
-  "TopParentId",
-  "SortName"
 );
 
 -- ── LinkedChildren: new in 12.0 ─────────────────────────────
