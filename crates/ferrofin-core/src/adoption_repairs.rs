@@ -61,6 +61,14 @@ pub async fn run_all(db: &Database) -> Result<(), ServiceError> {
             "backfilled alternate-version links from PrimaryVersionId"
         );
     }
+    let artists = merge_duplicate_music_artists(db).await?;
+    if artists > 0 {
+        tracing::info!(items = artists, "merged case-only duplicate music artists");
+    }
+    let people = merge_duplicate_people(db).await?;
+    if people > 0 {
+        tracing::info!(items = people, "merged case-only duplicate people");
+    }
     Ok(())
 }
 
@@ -509,6 +517,250 @@ pub async fn backfill_alternate_version_links(db: &Database) -> Result<usize, Se
     Ok(written)
 }
 
+/// `MergeDuplicateMusicArtists` (12.0): `MusicArtist` rows whose names differ
+/// only by case are folded onto one keeper — the one with the most direct
+/// children, then ancestor rows, then links, then the oldest — and every
+/// reference (`ParentId`, `OwnerId`, `AncestorIds`, `LinkedChildren` both
+/// ways, `UserData`, keeper's row winning any collision) is re-pointed before
+/// the duplicates are deleted. Case-only means `ToLowerInvariant`: no
+/// diacritic folding, no trimming.
+///
+/// # Errors
+/// Returns [`ServiceError`] if the underlying queries fail.
+pub async fn merge_duplicate_music_artists(db: &Database) -> Result<usize, ServiceError> {
+    const KEY: &str = "merge_duplicate_music_artists_v12";
+    if !once(db, KEY).await? {
+        return Ok(0);
+    }
+    let type_name = stored_type_name(BaseItemKind::MusicArtist).unwrap_or_default();
+    let merged = merge_case_duplicates(db, type_name, KeeperRule::Artist).await?;
+    done(db, KEY).await?;
+    Ok(merged)
+}
+
+/// `MergeDuplicatePeople` (12.0): the same fold for `Person` rows (keeper:
+/// most user data, then links, then oldest), then the `Peoples` lookup table
+/// grouped by `(lower(Name), PersonType)` — the row with the most
+/// `PeopleBaseItemMap` entries (tie: lowest `Id`) keeps them, colliding
+/// `(ItemId, Role)` map rows are dropped, the rest re-pointed, duplicates deleted.
+///
+/// # Errors
+/// Returns [`ServiceError`] if the underlying queries fail.
+pub async fn merge_duplicate_people(db: &Database) -> Result<usize, ServiceError> {
+    const KEY: &str = "merge_duplicate_people_v12";
+    if !once(db, KEY).await? {
+        return Ok(0);
+    }
+    let type_name = stored_type_name(BaseItemKind::Person).unwrap_or_default();
+    let mut merged = merge_case_duplicates(db, type_name, KeeperRule::Person).await?;
+    merged += merge_peoples_rows(db).await?;
+    done(db, KEY).await?;
+    Ok(merged)
+}
+
+/// Which counts pick the keeper of a duplicate group.
+#[derive(Clone, Copy)]
+enum KeeperRule {
+    /// `ChildCount desc, AncestorCount desc, LinkedCount desc, DateCreated asc`.
+    Artist,
+    /// `UserDataCount desc, LinkedCount desc, DateCreated asc`.
+    Person,
+}
+
+/// One candidate of a duplicate group, with the counts the keeper rule reads.
+struct Candidate {
+    id: String,
+    created: Option<String>,
+    children: i64,
+    ancestors: i64,
+    linked: i64,
+    user_data: i64,
+}
+
+async fn count(tx: &mut sqlx::SqliteConnection, sql: &str, id: &str) -> Result<i64, ServiceError> {
+    sqlx::query_scalar(sql)
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db_err)
+}
+
+/// Folds every case-only duplicate group of `type_name` onto its keeper.
+/// Returns the number of rows deleted.
+async fn merge_case_duplicates(
+    db: &Database,
+    type_name: &str,
+    rule: KeeperRule,
+) -> Result<usize, ServiceError> {
+    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        r#"SELECT "Id", "Name", "DateCreated" FROM "BaseItems"
+           WHERE "Type" = ?1 AND "Name" IS NOT NULL ORDER BY "Id""#,
+    )
+    .bind(type_name)
+    .fetch_all(db.pool())
+    .await
+    .map_err(db_err)?;
+    let mut groups: std::collections::BTreeMap<String, Vec<(String, Option<String>)>> =
+        std::collections::BTreeMap::new();
+    for (id, name, created) in rows {
+        groups
+            .entry(name.to_lowercase())
+            .or_default()
+            .push((id, created));
+    }
+    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    let mut deleted = 0usize;
+    for members in groups.into_values().filter(|g| g.len() > 1) {
+        let mut candidates = Vec::with_capacity(members.len());
+        for (id, created) in members {
+            candidates.push(Candidate {
+                children: count(
+                    &mut tx,
+                    r#"SELECT COUNT(*) FROM "BaseItems" WHERE "ParentId" = ?1"#,
+                    &id,
+                )
+                .await?,
+                ancestors: count(
+                    &mut tx,
+                    r#"SELECT COUNT(*) FROM "AncestorIds" WHERE "ParentItemId" = ?1"#,
+                    &id,
+                )
+                .await?,
+                linked: count(
+                    &mut tx,
+                    r#"SELECT COUNT(*) FROM "LinkedChildren" WHERE "ParentId" = ?1 OR "ChildId" = ?1"#,
+                    &id,
+                )
+                .await?,
+                user_data: count(
+                    &mut tx,
+                    r#"SELECT COUNT(*) FROM "UserData" WHERE "ItemId" = ?1"#,
+                    &id,
+                )
+                .await?,
+                id,
+                created,
+            });
+        }
+        // Descending on the counts, ascending on DateCreated (oldest wins).
+        candidates.sort_by(|a, b| {
+            let key = |c: &Candidate| match rule {
+                KeeperRule::Artist => (c.children, c.ancestors, c.linked, 0),
+                KeeperRule::Person => (c.user_data, c.linked, 0, 0),
+            };
+            key(b).cmp(&key(a)).then_with(|| a.created.cmp(&b.created))
+        });
+        let keeper = candidates[0].id.clone();
+        for dup in candidates.iter().skip(1) {
+            repoint_references(&mut tx, &dup.id, &keeper).await?;
+            sqlx::query(r#"DELETE FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(&dup.id)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            deleted += 1;
+        }
+    }
+    tx.commit().await.map_err(db_err)?;
+    Ok(deleted)
+}
+
+/// Re-points every reference from `dup` to `keeper`, the keeper's own rows
+/// winning any collision (the exact rewrite set of both 12.0 routines).
+async fn repoint_references(
+    tx: &mut sqlx::SqliteConnection,
+    dup: &str,
+    keeper: &str,
+) -> Result<(), ServiceError> {
+    let statements = [
+        r#"UPDATE "BaseItems" SET "ParentId" = ?2 WHERE "ParentId" = ?1"#,
+        r#"UPDATE "BaseItems" SET "OwnerId" = ?2 WHERE "OwnerId" = ?1"#,
+        r#"DELETE FROM "AncestorIds" WHERE "ParentItemId" = ?1
+             AND "ItemId" IN (SELECT "ItemId" FROM "AncestorIds" WHERE "ParentItemId" = ?2)"#,
+        r#"UPDATE "AncestorIds" SET "ParentItemId" = ?2 WHERE "ParentItemId" = ?1"#,
+        r#"DELETE FROM "LinkedChildren" WHERE "ParentId" = ?1
+             AND "ChildId" IN (SELECT "ChildId" FROM "LinkedChildren" WHERE "ParentId" = ?2)"#,
+        r#"UPDATE "LinkedChildren" SET "ParentId" = ?2,
+             "SortOrder" = "SortOrder" + (SELECT COALESCE(MAX("SortOrder"), -1) + 1
+                                          FROM "LinkedChildren" WHERE "ParentId" = ?2)
+           WHERE "ParentId" = ?1"#,
+        r#"DELETE FROM "LinkedChildren" WHERE "ChildId" = ?1
+             AND "ParentId" IN (SELECT "ParentId" FROM "LinkedChildren" WHERE "ChildId" = ?2)"#,
+        r#"UPDATE "LinkedChildren" SET "ChildId" = ?2 WHERE "ChildId" = ?1"#,
+        r#"DELETE FROM "UserData" WHERE "ItemId" = ?1
+             AND EXISTS (SELECT 1 FROM "UserData" k WHERE k."ItemId" = ?2
+                         AND k."UserId" = "UserData"."UserId"
+                         AND k."CustomDataKey" IS "UserData"."CustomDataKey")"#,
+        r#"UPDATE "UserData" SET "ItemId" = ?2 WHERE "ItemId" = ?1"#,
+    ];
+    for sql in statements {
+        sqlx::query(sql)
+            .bind(dup)
+            .bind(keeper)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+    }
+    Ok(())
+}
+
+/// `Peoples` rows grouped by `(lower(Name), PersonType)`: `(Id, map-row count)`.
+type PeopleGroups = std::collections::BTreeMap<(String, Option<String>), Vec<(String, i64)>>;
+
+/// `MergePeoplesRowsAsync`: the `Peoples` lookup table, grouped by
+/// `(lower(Name), PersonType)`.
+async fn merge_peoples_rows(db: &Database) -> Result<usize, ServiceError> {
+    let rows: Vec<(String, String, Option<String>, i64)> = sqlx::query_as(
+        r#"SELECT p."Id", p."Name", p."PersonType",
+                  (SELECT COUNT(*) FROM "PeopleBaseItemMap" m WHERE m."PeopleId" = p."Id")
+           FROM "Peoples" p ORDER BY p."Id""#,
+    )
+    .fetch_all(db.pool())
+    .await
+    .map_err(db_err)?;
+    let mut groups: PeopleGroups = std::collections::BTreeMap::new();
+    for (id, name, person_type, maps) in rows {
+        groups
+            .entry((name.to_lowercase(), person_type))
+            .or_default()
+            .push((id, maps));
+    }
+    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    let mut deleted = 0usize;
+    for mut members in groups.into_values().filter(|g| g.len() > 1) {
+        // Most map rows keeps them; tie → lowest Id (the input is Id-ordered).
+        members.sort_by_key(|(_, maps)| std::cmp::Reverse(*maps));
+        let keeper = members[0].0.clone();
+        for (dup, _) in members.iter().skip(1) {
+            sqlx::query(
+                r#"DELETE FROM "PeopleBaseItemMap" WHERE "PeopleId" = ?1
+                   AND EXISTS (SELECT 1 FROM "PeopleBaseItemMap" k WHERE k."PeopleId" = ?2
+                               AND k."ItemId" = "PeopleBaseItemMap"."ItemId"
+                               AND k."Role" IS "PeopleBaseItemMap"."Role")"#,
+            )
+            .bind(dup)
+            .bind(&keeper)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            sqlx::query(r#"UPDATE "PeopleBaseItemMap" SET "PeopleId" = ?2 WHERE "PeopleId" = ?1"#)
+                .bind(dup)
+                .bind(&keeper)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            sqlx::query(r#"DELETE FROM "Peoples" WHERE "Id" = ?1"#)
+                .bind(dup)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            deleted += 1;
+        }
+    }
+    tx.commit().await.map_err(db_err)?;
+    Ok(deleted)
+}
+
 #[cfg(test)]
 mod tests {
     use ferrofin_db::store::guid_to_db;
@@ -823,5 +1075,105 @@ mod tests {
             backfill_alternate_version_links(&db).await.expect("again"),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn case_only_duplicate_artists_fold_onto_the_keeper_once() {
+        let db = test_db().await;
+        let (keeper, dup, album, listener) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        seed_named_item(&db, keeper, BaseItemKind::MusicArtist, "Gojira").await;
+        seed_named_item(&db, dup, BaseItemKind::MusicArtist, "GOJIRA").await;
+        seed_named_item(&db, album, BaseItemKind::MusicAlbum, "Magma").await;
+        // The keeper is the one with a child.
+        sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?2 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(album))
+            .bind(guid_to_db(keeper))
+            .execute(db.writer())
+            .await
+            .expect("child");
+        crate::test_support::seed_user(&db, listener).await;
+        for (item, key) in [(dup, "a"), (dup, "b"), (keeper, "a")] {
+            sqlx::query(
+                r#"INSERT INTO "UserData" ("UserId", "ItemId", "CustomDataKey", "Played",
+                       "IsFavorite", "PlayCount", "PlaybackPositionTicks")
+                   VALUES (?1, ?2, ?3, 1, 0, 1, 0)"#,
+            )
+            .bind(guid_to_db(listener))
+            .bind(guid_to_db(item))
+            .bind(key)
+            .execute(db.writer())
+            .await
+            .expect("user data");
+        }
+        assert_eq!(merge_duplicate_music_artists(&db).await.expect("merge"), 1);
+        assert!(exists(&db, keeper).await && !exists(&db, dup).await);
+        let keys: Vec<String> = sqlx::query_scalar(
+            r#"SELECT "CustomDataKey" FROM "UserData" WHERE "ItemId" = ?1 ORDER BY 1"#,
+        )
+        .bind(guid_to_db(keeper))
+        .fetch_all(db.pool())
+        .await
+        .expect("keys");
+        assert_eq!(
+            keys,
+            vec!["a".to_owned(), "b".to_owned()],
+            "keeper's row wins a collision"
+        );
+        assert_eq!(merge_duplicate_music_artists(&db).await.expect("again"), 0);
+    }
+
+    #[tokio::test]
+    async fn case_only_duplicate_people_rows_fold_their_map_entries() {
+        let db = test_db().await;
+        let movie = Uuid::new_v4();
+        seed_item(&db, movie, BaseItemKind::Movie).await;
+        let (keeper, dup) = (guid_to_db(Uuid::new_v4()), guid_to_db(Uuid::new_v4()));
+        for (id, name) in [(&keeper, "Alice Parity"), (&dup, "alice parity")] {
+            sqlx::query(
+                r#"INSERT INTO "Peoples" ("Id", "Name", "PersonType") VALUES (?1, ?2, 'Actor')"#,
+            )
+            .bind(id)
+            .bind(name)
+            .execute(db.writer())
+            .await
+            .expect("person");
+        }
+        for (person, role) in [(&keeper, "Lead"), (&dup, "Lead"), (&dup, "Cameo")] {
+            sqlx::query(
+                r#"INSERT INTO "PeopleBaseItemMap" ("ItemId", "PeopleId", "Role") VALUES (?1, ?2, ?3)"#,
+            )
+            .bind(guid_to_db(movie))
+            .bind(person)
+            .bind(role)
+            .execute(db.writer())
+            .await
+            .expect("map");
+        }
+        assert_eq!(merge_duplicate_people(&db).await.expect("merge"), 1);
+        let roles: Vec<(String, String)> =
+            sqlx::query_as(r#"SELECT "PeopleId", "Role" FROM "PeopleBaseItemMap" ORDER BY "Role""#)
+                .fetch_all(db.pool())
+                .await
+                .expect("roles");
+        // The dup had more map rows, so it is the keeper; the colliding Lead
+        // row of the other one was dropped, its id is gone.
+        assert_eq!(
+            roles,
+            vec![
+                (dup.clone(), "Cameo".to_owned()),
+                (dup.clone(), "Lead".to_owned())
+            ]
+        );
+        let left: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM "Peoples""#)
+            .fetch_one(db.pool())
+            .await
+            .expect("count");
+        assert_eq!(left, 1);
+        assert_eq!(merge_duplicate_people(&db).await.expect("again"), 0);
     }
 }
