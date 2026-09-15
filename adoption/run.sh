@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # adoption/run.sh --fixtures DIR [--image IMAGE] [--only NAME] [--user USERNAME]
 #
-# Adopts every Jellyfin generation Ferrofin claims to support, through one image, on a FRESH
+# Adopts every Jellyfin release Ferrofin claims to support (10.11.8, 10.11.9, 10.11.10, 10.11.11,
+# 12.0, 12.1 via both upgrade routes), through one image, on a FRESH
 # copy of each pristine fixture under DIR, and checks each one the same way:
 #   1. the boot log names the expected generation, applies every migration, logs no ERROR;
 #   2. smoke.sh answers match Jellyfin 12.1's own answers on the same library
@@ -29,9 +30,13 @@ ORACLE=$FIXTURES/oracle/smoke-jellyfin-12.1.txt
 [ -n "$USER_NAME" ] || [ ! -f "$FIXTURES/oracle/user.txt" ] || USER_NAME=$(cat "$FIXTURES/oracle/user.txt")
 MEDIA=(); [ -f "$FIXTURES/media-mounts.sh" ] && . "$FIXTURES/media-mounts.sh"
 # name|fixture directory|host port
+# The generation is the id SET the gate matches, so 10.11.9 adopts as "10.11.8" (it adds no
+# migration) and 10.11.10 as "10.11.11" (both add the three NormalizedUsername ids).
 FIXTURE_TABLE=(
   "10.11.8|jellyfin-10.11.8|18099"
-  "10.11.11|jellyfin-10.11.11-synthetic|18098"
+  "10.11.8|jellyfin-10.11.9|18089"
+  "10.11.11|jellyfin-10.11.10|18088"
+  "10.11.11|jellyfin-10.11.11|18098"
   "12.0.0|jellyfin-12.0|18097"
   "12.1.0|jellyfin-12.1-from-10|18093"
   "12.1.0|jellyfin-12.1-from-12|18092"

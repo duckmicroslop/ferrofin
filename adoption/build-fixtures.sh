@@ -5,7 +5,7 @@
 # at DIR/jellyfin-10.11.8 (config/, data/jellyfin.db, root/, metadata/ …; the database should be
 # a checkpointed copy, e.g. `sqlite3 jellyfin.db ".backup jellyfin.db"`). Nothing here touches
 # that snapshot. Produces, next to it:
-#   jellyfin-10.11.11-synthetic/   the three EF steps 10.11.10/10.11.11 add, applied by hand
+#   jellyfin-10.11.9/  10.11.10/  10.11.11/   one boot of that jellyfin/jellyfin release on a copy
 #   jellyfin-12.0/                 one boot of jellyfin/jellyfin:12.0 on a copy
 #   jellyfin-12.1-from-10/         one boot of jellyfin/jellyfin:12.1 on a copy of 10.11.8
 #   jellyfin-12.1-from-12/         one boot of jellyfin/jellyfin:12.1 on a copy of 12.0
@@ -35,23 +35,14 @@ boot_jellyfin() { # boot_jellyfin <image> <dir> <port> — one boot, wait, let s
   echo "$(basename "$dir"): $(sqlite3 "$dir/data/jellyfin.db" 'SELECT COUNT(*) FROM __EFMigrationsHistory') EF ids"
 }
 
-if [ ! -d "$FIXTURES/jellyfin-10.11.11-synthetic" ]; then
-  cp -a "$SRC" "$FIXTURES/jellyfin-10.11.11-synthetic"
-  sqlite3 "$FIXTURES/jellyfin-10.11.11-synthetic/data/jellyfin.db" <<'SQL'
--- The three EF steps 10.11.10/10.11.11 add over 10.11.8, applied the way EF Core does:
--- AddColumn with a default, the code backfill (ToUpperInvariant; upper() suffices for ASCII
--- names, the server re-derives it with ICU on first boot anyway), the unique index.
-ALTER TABLE "Users" ADD "NormalizedUsername" TEXT NOT NULL DEFAULT '';
-UPDATE "Users" SET "NormalizedUsername" = upper("Username");
-CREATE UNIQUE INDEX "IX_Users_NormalizedUsername" ON "Users" ("NormalizedUsername");
-INSERT INTO "__EFMigrationsHistory" ("MigrationId","ProductVersion") VALUES
-  ('20260522092303_AddNormalizedUsername','10.11.11.0'),
-  ('20260522092304_UpdateNormalizedUsername','10.11.11.0'),
-  ('20260524120336_AddUniqueNormalizedUsernameIndex','10.11.11.0');
-PRAGMA wal_checkpoint(TRUNCATE);
-SQL
-  echo "jellyfin-10.11.11-synthetic: 71 EF ids"
-fi
+# Every 10.11 point release Ferrofin adopts, each a real boot of that release on a copy of the
+# snapshot: 10.11.9 leaves the 68 ids as they are; 10.11.10 and 10.11.11 add the three
+# NormalizedUsername ids (71).
+for v in 10.11.9:18089 10.11.10:18088 10.11.11:18098; do
+  ver=${v%%:*}; port=${v#*:}
+  [ -d "$FIXTURES/jellyfin-$ver" ] && continue
+  docker pull -q "jellyfin/jellyfin:$ver"; cp -a "$SRC" "$FIXTURES/jellyfin-$ver"; boot_jellyfin "jellyfin/jellyfin:$ver" "$FIXTURES/jellyfin-$ver" "$port"
+done
 if [ ! -d "$FIXTURES/jellyfin-12.0" ]; then docker pull -q jellyfin/jellyfin:12.0; cp -a "$SRC" "$FIXTURES/jellyfin-12.0"; boot_jellyfin jellyfin/jellyfin:12.0 "$FIXTURES/jellyfin-12.0" 18096; fi
 if [ ! -d "$FIXTURES/jellyfin-12.1-from-10" ]; then docker pull -q jellyfin/jellyfin:12.1; cp -a "$SRC" "$FIXTURES/jellyfin-12.1-from-10"; boot_jellyfin jellyfin/jellyfin:12.1 "$FIXTURES/jellyfin-12.1-from-10" 18094; fi
 if [ ! -d "$FIXTURES/jellyfin-12.1-from-12" ]; then docker pull -q jellyfin/jellyfin:12.1; cp -a "$FIXTURES/jellyfin-12.0" "$FIXTURES/jellyfin-12.1-from-12"; boot_jellyfin jellyfin/jellyfin:12.1 "$FIXTURES/jellyfin-12.1-from-12" 18095; fi

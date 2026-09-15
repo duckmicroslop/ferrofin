@@ -1,8 +1,9 @@
 # Adoption smoke test
 
 Ferrofin adopts a Jellyfin database in place. This harness proves that claim for every
-generation the gate accepts — **10.11.8, 10.11.9–10.11.11, 12.0 and 12.1** — by booting an
-image on a fresh copy of a real database of each and checking the result the same way:
+release the gate accepts — **10.11.8, 10.11.9, 10.11.10, 10.11.11, 12.0 and 12.1** (12.1 by
+both upgrade routes) — by booting an image on a fresh copy of a real database of each and
+checking the result the same way:
 
 1. the boot log names the expected generation, applies every migration and logs no `ERROR`;
 2. 38 read-only probes (`smoke.sh`) answer exactly what **Jellyfin 12.1** answers on the same
@@ -24,7 +25,9 @@ directory and the builder derives the rest with the official Jellyfin images:
 $FIXTURES/
   jellyfin-10.11.8/            supplied: config/, data/jellyfin.db, root/, metadata/ …
   media-mounts.sh              optional: MEDIA=(-v /host/path:/container/path:ro …)
-  jellyfin-10.11.11-synthetic/ built: 10.11.8 + the three NormalizedUsername EF steps
+  jellyfin-10.11.9/            built: one boot of jellyfin/jellyfin:10.11.9 on 10.11.8
+  jellyfin-10.11.10/           built: one boot of jellyfin/jellyfin:10.11.10 on 10.11.8
+  jellyfin-10.11.11/           built: one boot of jellyfin/jellyfin:10.11.11 on 10.11.8
   jellyfin-12.0/               built: one boot of jellyfin/jellyfin:12.0
   jellyfin-12.1-from-10/       built: one boot of jellyfin/jellyfin:12.1 on 10.11.8
   jellyfin-12.1-from-12/       built: one boot of jellyfin/jellyfin:12.1 on 12.0
@@ -44,7 +47,7 @@ probes every fixture as that account; `--user NAME` or `ADOPTION_USER` overrides
 **API key** in `ApiKeys`. Credentials are read from the copy at run time and never written.
 
 ```bash
-adoption/build-fixtures.sh --fixtures /path/to/fixtures     # once, ~15 min, pulls 12.0 + 12.1
+adoption/build-fixtures.sh --fixtures /path/to/fixtures     # once, ~25 min, pulls 10.11.9–12.1
 docker build -t ferrofin:bench .                            # the commit under test
 adoption/run.sh --fixtures /path/to/fixtures --image ferrofin:bench
 adoption/run.sh --fixtures … --only jellyfin-12.1-from-10   # one generation
@@ -54,12 +57,16 @@ Output is one line per generation:
 
 ```
 PASS  10.11.8   jellyfin-10.11.8
-PASS  10.11.11  jellyfin-10.11.11-synthetic
+PASS  10.11.8   jellyfin-10.11.9
+PASS  10.11.11  jellyfin-10.11.10
+PASS  10.11.11  jellyfin-10.11.11
 PASS  12.0.0    jellyfin-12.0
 PASS  12.1.0    jellyfin-12.1-from-10
 PASS  12.1.0    jellyfin-12.1-from-12
 ```
 
+The second column is the generation the gate matched — the id *set*, so 10.11.9 reports
+`10.11.8` and 10.11.10 reports `10.11.11`; `run.sh` knows which is expected for which fixture.
 A `FAIL` line names every check that failed and points at the diff; the copy is kept under
 `work/` with `<name>.server.log`, `<name>.smoke.txt` and `<name>.smoke2.txt` beside it.
 
