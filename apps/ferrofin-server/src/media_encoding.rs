@@ -268,6 +268,7 @@ pub fn build_media_encoding(
         manager,
         generator,
         paths as Arc<dyn ferrofin_traits::system::ServerApplicationPaths>,
+        encoder.encoder_path(),
     );
     // Without this the master playlist lists no `#EXT-X-IMAGE-STREAM-INF`, so a
     // client sees no trickplay tiles however many the library holds.

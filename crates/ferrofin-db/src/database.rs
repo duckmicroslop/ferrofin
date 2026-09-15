@@ -829,19 +829,39 @@ const JELLYFIN_10_11_8_MIGRATIONS: [&str; 68] = [
     "20260206200000_FixLibrarySubtitleDownloadLanguages",
 ];
 
+/// The `__EFMigrationsHistory` ids a Jellyfin 10.11.9–10.11.11 server adds on
+/// top of [`JELLYFIN_10_11_8_MIGRATIONS`], and the only later ids adoption
+/// accepts. 10.11.9 adds none; 10.11.10 and 10.11.11 add exactly these three,
+/// which together give `Users` a `NormalizedUsername` column (`TEXT NOT NULL
+/// DEFAULT ''`), backfill it (the middle id is a code-only routine), and put a
+/// unique index on it. Nothing else in the schema moved, so adoption reverts
+/// the two schema steps ([`revert_normalized_username`]) and the database is
+/// then byte-for-byte the 10.11.8 shape the baselined migrations describe.
+///
+/// Reverting is safe: Ferrofin matches usernames `COLLATE NOCASE` on
+/// `Username` itself and never writes the normalized column — left in place,
+/// its `DEFAULT ''` plus the unique index would fail the second user Ferrofin
+/// creates.
+const JELLYFIN_10_11_X_ADDITIVE_MIGRATIONS: [&str; 3] = [
+    "20260522092303_AddNormalizedUsername",
+    "20260522092304_UpdateNormalizedUsername",
+    "20260524120336_AddUniqueNormalizedUsernameIndex",
+];
+
 /// Ferrofin migrations at or below this version define the Jellyfin-owned
 /// schema shape; an adopted Jellyfin database already HAS that shape, so they
 /// are baselined as applied-without-running. Everything above is
 /// Ferrofin-additive (and written to be a no-op on Jellyfin-formatted data).
 const JELLYFIN_SHAPE_MIGRATION_HEAD: i64 = 7;
 
-/// Adopts an existing Jellyfin 10.11.8 SQLite database in place, if `conn` is
+/// Adopts an existing Jellyfin 10.11.8–10.11.11 SQLite database in place, if `conn` is
 /// one — the drop-in path (exercised end-to-end by `suite/roundtrip.sh`).
 ///
 /// Detection: an `__EFMigrationsHistory` table with no `_sqlx_migrations`
-/// alongside it. The applied EF migration-id set must match
-/// [`JELLYFIN_10_11_8_MIGRATIONS`] **exactly** — anything newer, older, or
-/// partial is refused loudly rather than half-adopted. On adoption the file
+/// alongside it. The applied EF migration-id set must be
+/// [`JELLYFIN_10_11_8_MIGRATIONS`], optionally plus
+/// [`JELLYFIN_10_11_X_ADDITIVE_MIGRATIONS`] (10.11.9–10.11.11) — anything
+/// else is refused loudly rather than half-adopted. On adoption the file
 /// is copied aside once (`<db>.pre-ferrofin`), Ferrofin's schema-shape migrations
 /// (`0001`–`0007`) are baselined into `_sqlx_migrations` without executing —
 /// the Jellyfin database already has that exact shape — and the caller's
@@ -871,36 +891,32 @@ async fn adopt_jellyfin_database(
         return Ok(());
     }
 
-    // Version gate: exactly the 10.11.8 set, or refuse (never half-adopt).
+    // Version gate: the 10.11.8 set, optionally plus the known 10.11.9–10.11.11
+    // additions — anything else is refused (never half-adopt).
     let applied: Vec<String> =
         sqlx::query_scalar(r#"SELECT "MigrationId" FROM "__EFMigrationsHistory" ORDER BY 1"#)
             .fetch_all(&mut *conn)
             .await?;
-    let mut expected: Vec<&str> = JELLYFIN_10_11_8_MIGRATIONS.to_vec();
-    expected.sort_unstable();
-    if applied
+    let missing: Vec<&str> = JELLYFIN_10_11_8_MIGRATIONS
+        .iter()
+        .filter(|e| !applied.iter().any(|a| a == *e))
+        .copied()
+        .collect();
+    let (additive, unknown): (Vec<&str>, Vec<&str>) = applied
         .iter()
         .map(String::as_str)
-        .ne(expected.iter().copied())
-    {
-        let missing: Vec<&str> = expected
-            .iter()
-            .filter(|e| !applied.iter().any(|a| a == *e))
-            .copied()
-            .collect();
-        let extra: Vec<&str> = applied
-            .iter()
-            .filter(|a| !expected.contains(&a.as_str()))
-            .map(String::as_str)
-            .collect();
+        .filter(|a| !JELLYFIN_10_11_8_MIGRATIONS.contains(a))
+        .partition(|a| JELLYFIN_10_11_X_ADDITIVE_MIGRATIONS.contains(a));
+    if !missing.is_empty() || !unknown.is_empty() {
         return Err(crate::DbError::UnsupportedJellyfinDatabase {
             reason: format!(
-                "its migration history does not match Jellyfin 10.11.8 \
-                 ({} applied vs {} expected; missing: {missing:?}; unknown: {extra:?}). \
-                 Ferrofin adopts exactly the 10.11.8 schema generation — \
-                 bring the database to Jellyfin 10.11.x first (or restore a backup)",
+                "its migration history does not match Jellyfin 10.11.8–10.11.11 \
+                 ({} applied vs {} expected; missing: {missing:?}; unknown: {unknown:?}). \
+                 Ferrofin adopts the 10.11.8 schema generation and the 10.11.9–10.11.11 \
+                 additions on top of it — bring the database to Jellyfin 10.11.x first \
+                 (or restore a backup)",
                 applied.len(),
-                expected.len(),
+                JELLYFIN_10_11_8_MIGRATIONS.len(),
             ),
         });
     }
@@ -915,6 +931,17 @@ async fn adopt_jellyfin_database(
             path: backup.display().to_string(),
             source,
         })?;
+    }
+
+    // A 10.11.10/10.11.11 database: undo its two schema additions so the file
+    // is exactly the 10.11.8 shape the baselined migrations describe. The
+    // safety copy above still holds the untouched original.
+    if !additive.is_empty() {
+        revert_normalized_username(conn).await?;
+        tracing::info!(
+            reverted = ?additive,
+            "reverted the Jellyfin 10.11.10+ NormalizedUsername additions for adoption"
+        );
     }
 
     // Baseline the schema-shape migrations: recorded as applied, never run.
@@ -938,8 +965,31 @@ async fn adopt_jellyfin_database(
         database = %path.display(),
         backup = %backup.display(),
         baselined_through = JELLYFIN_SHAPE_MIGRATION_HEAD,
-        "adopted an existing Jellyfin 10.11.8 database in place"
+        "adopted an existing Jellyfin 10.11.x database in place"
     );
+    Ok(())
+}
+
+/// Drops the `Users.NormalizedUsername` column and its unique index, the two
+/// schema steps Jellyfin 10.11.10 added over 10.11.8 (see
+/// [`JELLYFIN_10_11_X_ADDITIVE_MIGRATIONS`]). Each step is skipped when its
+/// object is already absent, so a history that recorded only the column
+/// migration reverts cleanly too. The index goes first: SQLite refuses to drop
+/// an indexed column.
+async fn revert_normalized_username(conn: &mut sqlx::SqliteConnection) -> Result<()> {
+    sqlx::query(r#"DROP INDEX IF EXISTS "IX_Users_NormalizedUsername""#)
+        .execute(&mut *conn)
+        .await?;
+    let has_column: Option<i64> = sqlx::query_scalar(
+        r"SELECT 1 FROM pragma_table_info('Users') WHERE name = 'NormalizedUsername'",
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    if has_column.is_some() {
+        sqlx::query(r#"ALTER TABLE "Users" DROP COLUMN "NormalizedUsername""#)
+            .execute(&mut *conn)
+            .await?;
+    }
     Ok(())
 }
 
@@ -1987,6 +2037,121 @@ mod tests {
         Database::connect_sized(&url, Some(2))
             .await
             .expect("re-open after adoption");
+    }
+
+    /// Applies the two 10.11.10 schema steps to a seeded 10.11.8 fixture, the
+    /// way EF Core does (`AddColumn` with a default, then the unique index).
+    async fn add_normalized_username(path: &std::path::Path) {
+        use sqlx::ConnectOptions;
+        let mut conn = SqliteConnectOptions::new()
+            .filename(path)
+            .connect()
+            .await
+            .expect("open fixture db");
+        sqlx::raw_sql(
+            r#"ALTER TABLE "Users" ADD "NormalizedUsername" TEXT NOT NULL DEFAULT '';
+               UPDATE "Users" SET "NormalizedUsername" = upper("Username");
+               CREATE UNIQUE INDEX "IX_Users_NormalizedUsername"
+                   ON "Users" ("NormalizedUsername");"#,
+        )
+        .execute(&mut conn)
+        .await
+        .expect("apply 10.11.10 additions");
+        sqlx::Connection::close(conn).await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn adopts_a_jellyfin_10_11_11_database_by_reverting_normalized_username() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        let mut ids = JELLYFIN_10_11_8_MIGRATIONS.to_vec();
+        ids.extend(JELLYFIN_10_11_X_ADDITIVE_MIGRATIONS);
+        seed_jellyfin_fixture(&path, &ids).await;
+        add_normalized_username(&path).await;
+
+        let url = format!("sqlite://{}", path.display());
+        let db = Database::connect_sized(&url, Some(2))
+            .await
+            .expect("adoption succeeds");
+
+        // The 10.11.10 additions are gone: no column, no index.
+        let column: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM pragma_table_info('Users') WHERE name = 'NormalizedUsername'",
+        )
+        .fetch_optional(db.pool())
+        .await
+        .expect("column probe");
+        assert!(
+            column.is_none(),
+            "NormalizedUsername column must be dropped"
+        );
+        let index: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' \
+             AND name = 'IX_Users_NormalizedUsername'",
+        )
+        .fetch_optional(db.pool())
+        .await
+        .expect("index probe");
+        assert!(
+            index.is_none(),
+            "IX_Users_NormalizedUsername must be dropped"
+        );
+
+        // Jellyfin's own bookkeeping stays untouched (71 rows), and the
+        // pre-adoption copy holds the original.
+        let ef_rows: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM "__EFMigrationsHistory""#)
+            .fetch_one(db.pool())
+            .await
+            .expect("ef rows");
+        assert_eq!(ef_rows, 71);
+        assert!(path.with_extension("db.pre-ferrofin").exists());
+
+        // Two users created the Ferrofin way (never touching the normalized
+        // column) must not collide — the reason the column is reverted.
+        for (id, name) in [("A", "alice"), ("B", "bob")] {
+            sqlx::query(
+                r#"INSERT INTO "Users" ("Id","AuthenticationProviderId","DisplayCollectionsView",
+                   "DisplayMissingEpisodes","EnableAutoLogin","EnableLocalPassword",
+                   "EnableNextEpisodeAutoPlay","EnableUserPreferenceAccess","HidePlayedInLatest",
+                   "InternalId","InvalidLoginAttemptCount","MaxActiveSessions","MustUpdatePassword",
+                   "PasswordResetProviderId","PlayDefaultAudioTrack","RememberAudioSelections",
+                   "RememberSubtitleSelections","RowVersion","SubtitleMode","SyncPlayAccess",
+                   "Username")
+                   VALUES (?1,'auth',0,0,0,0,1,1,1,
+                           (SELECT COALESCE(MAX("InternalId"),0)+1 FROM "Users"),
+                           0,0,0,'reset',1,1,1,0,0,0,?2)"#,
+            )
+            .bind(id)
+            .bind(name)
+            .execute(db.writer())
+            .await
+            .expect("insert user without NormalizedUsername");
+        }
+
+        drop(db);
+        Database::connect_sized(&url, Some(2))
+            .await
+            .expect("re-open after adoption");
+    }
+
+    #[tokio::test]
+    async fn refuses_a_jellyfin_database_with_an_unknown_migration() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        let mut ids = JELLYFIN_10_11_8_MIGRATIONS.to_vec();
+        ids.push("20270101000000_SomethingFromTheFuture");
+        seed_jellyfin_fixture(&path, &ids).await;
+
+        let url = format!("sqlite://{}", path.display());
+        let err = Database::connect_sized(&url, Some(2))
+            .await
+            .expect_err("adoption must refuse an id it cannot revert");
+        assert!(
+            matches!(err, crate::DbError::UnsupportedJellyfinDatabase { .. }),
+            "unexpected error: {err}"
+        );
+        assert!(err.to_string().contains("SomethingFromTheFuture"));
+        assert!(!path.with_extension("db.pre-ferrofin").exists());
     }
 
     #[tokio::test]

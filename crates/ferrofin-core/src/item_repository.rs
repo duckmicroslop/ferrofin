@@ -44,6 +44,7 @@ use crate::translate_query::{
     to_guid_strings,
 };
 use crate::user_entity_ext::{guid_preference, has_permission, live_tv_enabled_for};
+use crate::virtual_paths::VirtualPathExpander;
 use sqlx::{FromRow, QueryBuilder, Row, Sqlite};
 
 /// The concrete item repository.
@@ -57,6 +58,10 @@ pub struct FerrofinItemRepository {
     /// The `UserRootFolder`/`AggregateFolder` ids, injected once by the
     /// composition root (see [`FerrofinItemRepository::with_root_ids`]).
     roots: Option<RootFolderIds>,
+    /// Expands the `%MetadataPath%`/`%AppDataPath%` tokens an adopted Jellyfin
+    /// database stores in image paths (see
+    /// [`FerrofinItemRepository::with_virtual_paths`]).
+    virtual_paths: VirtualPathExpander,
 }
 
 impl std::fmt::Debug for FerrofinItemRepository {
@@ -95,6 +100,7 @@ impl FerrofinItemRepository {
         Self {
             db,
             item_type_lookup,
+            virtual_paths: VirtualPathExpander::identity(),
             roots: None,
         }
     }
@@ -109,6 +115,16 @@ impl FerrofinItemRepository {
     #[must_use]
     pub fn with_root_ids(mut self, roots: RootFolderIds) -> Self {
         self.roots = Some(roots);
+        self
+    }
+
+    /// Installs the server's [`VirtualPathExpander`], so image rows adopted
+    /// from Jellyfin (`%MetadataPath%/library/…`) come back as real paths —
+    /// the read half of `BaseItemRepository.Map`. Called once by the
+    /// composition root; without it stored tokens pass through verbatim.
+    #[must_use]
+    pub fn with_virtual_paths(mut self, virtual_paths: VirtualPathExpander) -> Self {
+        self.virtual_paths = virtual_paths;
         self
     }
 
@@ -1713,13 +1729,16 @@ pub(crate) fn image_type_to_disc(image_type: ImageType) -> i32 {
 /// The stored `Blurhash` is a UTF-8 byte blob; an empty blob (or one that is not
 /// valid UTF-8) becomes [`None`]. A zero/negative width or height (the "unknown"
 /// sentinel) is preserved as-is; the API layer nulls those out per Jellyfin.
-fn image_info_from_row(row: BaseItemImageInfoEntity) -> ItemImageInfo {
+fn image_info_from_row(
+    row: BaseItemImageInfoEntity,
+    virtual_paths: &VirtualPathExpander,
+) -> ItemImageInfo {
     let blur_hash = row
         .blurhash
         .filter(|b| !b.is_empty())
         .and_then(|b| String::from_utf8(b).ok());
     ItemImageInfo {
-        path: row.path,
+        path: virtual_paths.expand(&row.path),
         image_type: image_type_from_disc(row.image_type),
         date_modified: row.date_modified.unwrap_or_else(default_epoch),
         width: i32::try_from(row.width).unwrap_or(0),
@@ -2233,7 +2252,10 @@ impl ItemRepository for FerrofinItemRepository {
         .fetch_all(self.db.pool())
         .await
         .map_err(db_err)?;
-        Ok(rows.into_iter().map(image_info_from_row).collect())
+        Ok(rows
+            .into_iter()
+            .map(|row| image_info_from_row(row, &self.virtual_paths))
+            .collect())
     }
 
     async fn swap_item_images(
@@ -3664,6 +3686,43 @@ mod tests {
         assert_eq!(
             repository.get_item_list(&both).await.expect("both").len(),
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn get_image_infos_expands_jellyfin_virtual_paths() {
+        let db = test_db().await;
+        let item = Uuid::from_u128(0x9003);
+        seed_named_item(&db, item, BaseItemKind::Series, "Adopted").await;
+        // What an adopted Jellyfin row holds: the metadata dir as a token.
+        sqlx::query(
+            r#"INSERT INTO "BaseItemImageInfos"
+                ("Id", "Blurhash", "DateModified", "Height", "ImageType", "ItemId", "Path", "Width")
+                VALUES (?1, NULL, NULL, 0, 4, ?2, '%MetadataPath%/library/9c/9c3f/thumb.jpg', 0)"#,
+        )
+        .bind(guid_to_db(Uuid::from_u128(0x9103)))
+        .bind(guid_to_db(item))
+        .execute(db.writer())
+        .await
+        .expect("insert thumb");
+
+        // Without an expander the token passes through verbatim.
+        let raw = repo(&db).get_image_infos(item).await.expect("images");
+        assert_eq!(raw[0].path, "%MetadataPath%/library/9c/9c3f/thumb.jpg");
+
+        // With the server's paths it is the file the copied metadata/ holds.
+        let root = tempfile::tempdir().expect("tempdir");
+        let paths = crate::app_paths::test_paths(root.path());
+        let repository = repo(&db).with_virtual_paths(VirtualPathExpander::from_paths(&*paths));
+        let images = repository.get_image_infos(item).await.expect("images");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].image_type, ImageType::Logo);
+        assert_eq!(
+            images[0].path,
+            format!(
+                "{}/library/9c/9c3f/thumb.jpg",
+                ferrofin_traits::system::ServerApplicationPaths::internal_metadata_path(&*paths)
+            )
         );
     }
 

@@ -159,14 +159,6 @@ const MIN_SEGMENT_WAIT_TIMEOUT: std::time::Duration =
 /// `MimeTypes.GetMimeType("playlist.m3u8")`.
 const HLS_PLAYLIST_MIME: &str = "application/vnd.apple.mpegurl";
 
-/// The ffmpeg program handed to the transcoder seam.
-///
-/// The [`StreamStatePlanner`] carries no encoder path, so the runtime relies on
-/// `ffmpeg` being on `PATH` (matching the probe-only encoder default). The
-/// Wave-8 planner resolves a concrete encoder path into the plan's args when a
-/// non-default binary is configured.
-const FFMPEG_PROGRAM: &str = "ffmpeg";
-
 /// How many segments ahead of a running transcode's on-disk progress a request
 /// may be before it is treated as a *seek* (evict the job and restart from the
 /// requested segment) rather than a *read-ahead* (wait for the running job to
@@ -218,6 +210,13 @@ where
     manager: Arc<TranscodeManagerImpl<S, FsFileCleaner>>,
     generator: Arc<DynamicHlsPlaylistGenerator<C>>,
     paths: Arc<dyn ServerApplicationPaths>,
+    /// The ffmpeg binary every transcode spawns — the same one the startup
+    /// probe validated and whose capabilities the planner's arguments assume
+    /// (`IMediaEncoder.EncoderPath`). A bare `ffmpeg` here would resolve
+    /// through `PATH` to whatever the distro ships, which once meant planning
+    /// `-c:a libfdk_aac` against jellyfin-ffmpeg and running it on a Debian
+    /// build without it.
+    ffmpeg_path: String,
     /// Per-playlist async locks serialising the "find/evict/start job" critical
     /// section of [`Self::resolve_dynamic_segment`]. Without it two concurrent
     /// seek requests for the same output could each spawn an ffmpeg writing the
@@ -309,12 +308,15 @@ where
     /// * `manager` — the live transcode-job registry (`start_ffmpeg` / kill).
     /// * `generator` — the `.m3u8` playlist generator.
     /// * `paths` — server paths (for the transcode cache directory).
+    /// * `ffmpeg_path` — the probed ffmpeg binary every transcode spawns
+    ///   (`MediaEncoder::encoder_path`).
     pub fn new(
         planner: P,
         transcoder: T,
         manager: Arc<TranscodeManagerImpl<S, FsFileCleaner>>,
         generator: Arc<DynamicHlsPlaylistGenerator<C>>,
         paths: Arc<dyn ServerApplicationPaths>,
+        ffmpeg_path: impl Into<String>,
     ) -> Self {
         Self {
             planner,
@@ -322,6 +324,7 @@ where
             manager,
             generator,
             paths,
+            ffmpeg_path: ffmpeg_path.into(),
             segment_locks: Arc::new(KeyedLocks::new()),
             restart_failures: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             trickplay: None,
@@ -566,7 +569,7 @@ where
 
         // (Re)start the transcode from this segment and wait for it.
         let start = StartFfMpegRequest {
-            program: FFMPEG_PROGRAM,
+            program: &self.ffmpeg_path,
             state: &plan.state,
             output_path: &playlist_path,
             arguments: plan.arguments.clone(),
@@ -701,7 +704,7 @@ where
                 let mut state = plan.state.clone();
                 state.wait_for_path = Some(start_segment.clone());
                 let start_request = StartFfMpegRequest {
-                    program: FFMPEG_PROGRAM,
+                    program: &self.ffmpeg_path,
                     state: &state,
                     output_path: &plan.playlist_path,
                     arguments: plan.arguments.clone(),
@@ -869,7 +872,7 @@ where
                     )));
                 }
                 let start = StartFfMpegRequest {
-                    program: FFMPEG_PROGRAM,
+                    program: &self.ffmpeg_path,
                     state: &plan.state,
                     output_path: &playlist_path,
                     arguments: plan.arguments.clone(),
@@ -986,7 +989,7 @@ where
             .await?;
         let output = plan.state.output_file_path.clone();
         let start = StartFfMpegRequest {
-            program: FFMPEG_PROGRAM,
+            program: &self.ffmpeg_path,
             state: &plan.state,
             output_path: Path::new(&output),
             arguments: plan.arguments.clone(),
@@ -1459,6 +1462,10 @@ mod tests {
         NoopSessionReporter,
     >;
 
+    /// A non-`PATH` binary path: the spawn must carry exactly this, never a
+    /// bare `ffmpeg` (see [`HlsStreamManagerImpl::ffmpeg_path`]).
+    const TEST_FFMPEG_PATH: &str = "/opt/jellyfin-ffmpeg/ffmpeg";
+
     fn manager_full(
         dir: &Path,
         script: FakeScript,
@@ -1476,7 +1483,14 @@ mod tests {
         let paths = Arc::new(FakePaths {
             transcode: dir.to_string_lossy().into_owned(),
         });
-        let mgr = HlsStreamManagerImpl::new(planner, transcoder, manager, generator(), paths);
+        let mgr = HlsStreamManagerImpl::new(
+            planner,
+            transcoder,
+            manager,
+            generator(),
+            paths,
+            TEST_FFMPEG_PATH,
+        );
         (mgr, requests, spawns)
     }
 
@@ -1681,6 +1695,11 @@ mod tests {
         // Exactly one transcode was started (the second call found the file),
         // planned as an EVENT job from segment 0.
         assert_eq!(spawns.requests.lock().unwrap().len(), 1);
+        assert_eq!(
+            spawns.requests.lock().unwrap()[0].program,
+            TEST_FFMPEG_PATH,
+            "the transcode must spawn the probed ffmpeg, not a bare `ffmpeg` off PATH"
+        );
         let calls = recorded.lock().unwrap();
         assert!(
             calls

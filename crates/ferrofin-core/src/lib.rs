@@ -224,6 +224,7 @@ pub mod user_manager;
 pub mod user_root_folder;
 pub mod user_view_manager;
 pub mod virtual_folder_manager;
+pub mod virtual_paths;
 pub mod years;
 
 #[cfg(test)]

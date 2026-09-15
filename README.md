@@ -118,6 +118,10 @@ helm install ferrofin oci://ghcr.io/mangoleaf/ferrofin/charts/ferrofin -n ferrof
 See [`charts/ferrofin/README.md`](charts/ferrofin/README.md) and
 [`values.example.yaml`](charts/ferrofin/values.example.yaml) for a worked configuration.
 
+**Bare metal under systemd** (release binary + jellyfin-ffmpeg and jellyfin-web from
+Jellyfin's apt repository): follow [`docs/INSTALL.md`](docs/INSTALL.md); an example unit is
+in [`contrib/systemd/ferrofin.service`](contrib/systemd/ferrofin.service).
+
 **From source** (needs the pinned Rust toolchain; ffmpeg is optional and its absence only
 disables transcoding):
 
@@ -140,10 +144,13 @@ Configuration is via CLI flags, `FERROFIN_*` environment variables, or
 ## Migrating from Jellyfin
 
 Ferrofin reads Jellyfin's database directly. Point it at a data directory containing a
-Jellyfin 10.11.8 `jellyfin.db` and on first boot it detects the database, validates its
-migration set (and refuses loudly rather than half-adopting an unexpected version), and
+Jellyfin 10.11.8–10.11.11 `jellyfin.db` and on first boot it detects the database, validates
+its migration set (and refuses loudly rather than half-adopting an unexpected version), and
 adopts it in place: **no re-scan, no re-import**. Users, watch state, playlists, and Live TV
-configuration carry forward.
+configuration carry forward. A 10.11.10 or 10.11.11 database carries one addition over
+10.11.8, the `Users.NormalizedUsername` column and its unique index; adoption drops both
+(Ferrofin matches usernames case-insensitively on `Username` itself), so the adopted
+schema is the 10.11.8 shape either way.
 
 > ### ⚠ Migration is one-way. Back up first.
 >
@@ -157,6 +164,13 @@ configuration carry forward.
 > 2. **Copy the whole Jellyfin data directory somewhere safe** (the database, its `-wal`
 >    and `-shm` files if present, and the metadata/config folders).
 > 3. Start Ferrofin against a copy, not the original, until you are satisfied.
+>
+> Bring **three** things across, not just the database. `jellyfin.db` holds the items,
+> users and watch state; the **library definitions** are the folders under `root/default/`
+> (one per library, holding the `.mblink` path shortcuts and `options.xml`, which Ferrofin
+> imports into its own `options.json` on first read), and the **images** are the files
+> under `metadata/`. With only the database copied the libraries are still browsable but
+> the admin Libraries page is empty and every poster shows its blurhash placeholder.
 >
 > If you decide to go back to Jellyfin, restore that backup. Anything that happened in
 > Ferrofin after the switch (watch state, new users, playlists) stays in Ferrofin.
