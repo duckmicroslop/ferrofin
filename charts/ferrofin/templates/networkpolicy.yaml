@@ -14,10 +14,14 @@ spec:
 
   {{- if has "Ingress" .Values.networkPolicy.policyTypes }}
   ingress:
-    # Allow traffic to Ferrofin's HTTP port
+    # Allow HTTP and optional discovery traffic from the configured sources
     - ports:
         - protocol: TCP
           port: http
+        {{- if .Values.discovery.enabled }}
+        - protocol: UDP
+          port: discovery
+        {{- end }}
       {{- if not .Values.networkPolicy.ingress.allowExternal }}
       from:
         {{- if or .Values.networkPolicy.ingress.podSelector .Values.networkPolicy.ingress.namespaceSelector }}

@@ -52,6 +52,7 @@ pedantic = { level = "warn", priority = -1 }
 doc_markdown = "allow"
 
 [workspace.dependencies]
+if-addrs = { version = "0.15.0", features = ["link-local"] }
 # ── intra-workspace (path deps added as crates land) ───────────────
 ferrofin-util = { path = "crates/ferrofin-util" }
 ferrofin-keyframes = { path = "crates/ferrofin-keyframes" }

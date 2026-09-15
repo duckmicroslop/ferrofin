@@ -57,6 +57,10 @@ podAnnotations: {}
 # -- Labels added to the pod.
 podLabels: {}
 
+# -- Share the node network for LAN discovery. Requires a LAN-connected node,
+# free ports 8096/TCP and 7359/UDP, and strategy.type: Recreate.
+hostNetwork: false
+
 # -- Pod-level security context. The image runs as uid 1000, so default
 # fsGroup 1000: kubelet fixes volume group-ownership on mount (only when the
 # volume root mismatches), so a PV written by root can never lock the server
@@ -72,6 +76,15 @@ service:
   type: ClusterIP
   # -- Service port (also the container port Ferrofin listens on).
   port: 8096
+
+# -- Optional UDP exposure; does not change the application's AutoDiscovery setting.
+# A separate Service avoids mixing TCP and UDP on a LoadBalancer. Service exposure
+# alone does not forward LAN broadcasts; see README.md for LAN topology.
+discovery:
+  enabled: false
+  service:
+    type: ClusterIP
+    annotations: {}
 
 # -- Ingress (standard networking.k8s.io/v1). Most clusters use this to expose Ferrofin.
 ingress:
