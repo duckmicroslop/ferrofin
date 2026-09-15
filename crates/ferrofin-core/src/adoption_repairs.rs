@@ -94,7 +94,8 @@ async fn done(db: &Database, key: &str) -> Result<(), ServiceError> {
 /// truth about membership. It reads `LinkedChildren` from every playlist/box
 /// set and `LocalAlternateVersions` / `LinkedAlternateVersions` from every
 /// video, writes the rows, and flips the adoption record's flag in the same
-/// transaction. A 12.0 adoption, a Ferrofin-native database and an install
+/// transaction. Runs for every 10.11.x generation (10.11.8 through
+/// 10.11.11). A 12.0 adoption, a Ferrofin-native database and an install
 /// adopted before the record existed have no such record and are skipped.
 ///
 /// Returns the number of rows written.
@@ -105,7 +106,9 @@ pub async fn import_membership_once(db: &Database) -> Result<usize, ServiceError
     let Some(state) = db.adoption_state().await.map_err(meta_err)? else {
         return Ok(0);
     };
-    if state.generation != "10.11.8" || state.membership_import_done {
+    // Every 10.11.x release keeps membership only in `Data` JSON; 12.0's
+    // `LinkedChildren` rows are the store and its JSON is frozen.
+    if !state.generation.starts_with("10.11.") || state.membership_import_done {
         return Ok(0);
     }
     let playlist = stored_type_name(BaseItemKind::Playlist).unwrap_or_default();
@@ -815,10 +818,17 @@ mod tests {
         .expect("links")
     }
 
+    /// Every 10.11.x generation keeps membership only in `Data` JSON, so the
+    /// one-shot import runs for 10.11.11 exactly as for 10.11.8 (the live
+    /// 10.11.11 fixture lost all 395 playlist rows when only the exact
+    /// "10.11.8" name was accepted).
+    #[rstest::rstest]
+    #[case("10.11.8")]
+    #[case("10.11.11")]
     #[tokio::test]
-    async fn membership_is_imported_once_for_a_new_10_11_8_adoption() {
+    async fn membership_is_imported_once_for_a_new_10_11_adoption(#[case] generation: &str) {
         let db = test_db().await;
-        db.record_adoption("10.11.8").await.expect("record");
+        db.record_adoption(generation).await.expect("record");
         let (playlist, a, b, primary, alt) = (
             Uuid::new_v4(),
             Uuid::new_v4(),
