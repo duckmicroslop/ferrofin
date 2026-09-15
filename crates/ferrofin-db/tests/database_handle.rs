@@ -45,11 +45,12 @@ async fn display_preferences_row(db: &Database, id: i64, user: &str) -> i64 {
             "PasswordResetProviderId", "PlayDefaultAudioTrack",
             "RememberAudioSelections", "RememberSubtitleSelections", "RowVersion",
             "SubtitleMode", "SyncPlayAccess", "Username", "NormalizedUsername"
-        ) VALUES (?1, 'auth', 0, 0, 0, 0, 0, 1, 0, ?2, 0, 5, 0, 'reset', 1, 1, 1, 0, 0, 0, ?3, upper(?3))"#,
+        ) VALUES (?1, 'auth', 0, 0, 0, 0, 0, 1, 0, ?2, 0, 5, 0, 'reset', 1, 1, 1, 0, 0, 0, ?3, ?4)"#,
     )
     .bind(user)
     .bind(id)
     .bind(format!("user-{id}"))
+    .bind(format!("USER-{id}"))
     .execute(db.writer())
     .await
     .expect("insert user");

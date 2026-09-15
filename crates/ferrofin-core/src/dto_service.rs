@@ -57,6 +57,8 @@ use std::sync::{Arc, OnceLock};
 use async_trait::async_trait;
 use ferrofin_db::Database;
 use ferrofin_db::entities::base_items::{BaseItemEntity, BaseItemImageInfoEntity};
+
+use crate::virtual_paths::VirtualPathExpander;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_db::store::guid_to_db;
 use ferrofin_model::data::{BaseItemKind, CollectionType, MediaType};
@@ -308,9 +310,12 @@ fn image_type_from_disc(disc: i32) -> ImageType {
 
 /// Maps a stored `BaseItemImageInfos` row onto the in-flight [`ItemImageInfo`]
 /// the image processor and tag helpers consume.
-fn to_image_info(row: &BaseItemImageInfoEntity) -> ItemImageInfo {
+fn to_image_info(
+    row: &BaseItemImageInfoEntity,
+    virtual_paths: &VirtualPathExpander,
+) -> ItemImageInfo {
     ItemImageInfo {
-        path: row.path.clone(),
+        path: virtual_paths.expand(&row.path),
         image_type: image_type_from_disc(row.image_type),
         date_modified: row.date_modified.unwrap_or_default(),
         width: i32::try_from(row.width).unwrap_or(0),
@@ -1061,6 +1066,9 @@ pub struct FerrofinDtoService {
     media_sources: Arc<dyn MediaSourceManager>,
     chapters: Arc<dyn ChapterManager>,
     trickplay: Arc<dyn TrickplayManager>,
+    /// Expands `%MetadataPath%`/`%AppDataPath%` in adopted image rows (see
+    /// [`FerrofinDtoService::with_virtual_paths`]).
+    virtual_paths: VirtualPathExpander,
     /// The MusicBrainz root the "Links" row points music items at — the
     /// configured mirror, as C# uses `Plugin.Instance.Configuration.Server`.
     musicbrainz_server: String,
@@ -1111,6 +1119,7 @@ impl FerrofinDtoService {
             media_sources,
             chapters,
             trickplay,
+            virtual_paths: VirtualPathExpander::identity(),
             musicbrainz_server: ferrofin_providers::musicbrainz::DEFAULT_BASE_URL.to_owned(),
             live_tv: Arc::new(OnceLock::new()),
         }
@@ -1123,6 +1132,15 @@ impl FerrofinDtoService {
     /// `ChannelNumber`, no `ChannelType`, no `CurrentProgram`.
     pub fn set_live_tv(&self, live_tv: Arc<dyn ferrofin_traits::stubs::LiveTvManager>) {
         let _ = self.live_tv.set(live_tv);
+    }
+
+    /// Installs the server's [`VirtualPathExpander`], so the image rows this
+    /// service reads for tags, blurhashes and sizes resolve the same files the
+    /// image endpoints serve. Called once by the composition root.
+    #[must_use]
+    pub fn with_virtual_paths(mut self, virtual_paths: VirtualPathExpander) -> Self {
+        self.virtual_paths = virtual_paths;
+        self
     }
 
     /// Points the music "Links" row at a configured MusicBrainz mirror. Empty
@@ -1148,7 +1166,10 @@ impl FerrofinDtoService {
         .await
         .map_err(db_err)?;
 
-        Ok(rows.iter().map(to_image_info).collect())
+        Ok(rows
+            .iter()
+            .map(|row| to_image_info(row, &self.virtual_paths))
+            .collect())
     }
 
     /// Batch form of [`Self::load_images`]: all image rows for `item_ids` in one
@@ -1178,7 +1199,9 @@ impl FerrofinDtoService {
             let rows = query.fetch_all(self.db.pool()).await.map_err(db_err)?;
             for row in &rows {
                 if let Ok(item_id) = Uuid::parse_str(&row.item_id) {
-                    map.entry(item_id).or_default().push(to_image_info(row));
+                    map.entry(item_id)
+                        .or_default()
+                        .push(to_image_info(row, &self.virtual_paths));
                 }
             }
         }
@@ -3676,19 +3699,19 @@ impl FerrofinDtoService {
             // (C# AttachPeople: `People[].Id` is the per-name item id, the
             // one favorites are written against — never the per-credit
             // `Peoples` row id, which fragments a person across types).
-            // One lowercase per distinct spelling, not one per credit per
+            // One clean key per distinct spelling, not one per credit per
             // item: `slot_by_name` maps every RAW spelling seen to the slot
-            // of the case-insensitively-deduped name it resolves through, so
+            // of the name it resolves through using the same clean key as the database, so
             // the projection can look the id up by the stored string.
             let mut names: Vec<String> = Vec::new();
-            let mut slot_by_lower: HashMap<String, usize> = HashMap::new();
+            let mut slot_by_clean: HashMap<String, usize> = HashMap::new();
             let mut slot_by_name: HashMap<String, usize> = HashMap::new();
             for person in people.values().flatten() {
                 if slot_by_name.contains_key(person.name.as_str()) {
                     continue;
                 }
-                let slot = *slot_by_lower
-                    .entry(person.name.to_lowercase())
+                let slot = *slot_by_clean
+                    .entry(crate::text_util::get_clean_value(&person.name))
                     .or_insert_with(|| {
                         names.push(person.name.clone());
                         names.len() - 1
@@ -8030,13 +8053,21 @@ mod tests {
 
     /// Every credit spelling on the page must resolve to the ONE by-name `Person`
     /// item (what favorites are written against), not to its per-credit row id.
+    #[rstest::rstest]
+    #[case("Leonardo DiCaprio", "LEONARDO DICAPRIO")]
+    #[case("ΟΣ", "οσ")]
+    #[case("Élodie", "elodie")]
+    #[case("𐐀", "𐐨")]
     #[tokio::test]
-    async fn people_ids_resolve_for_every_credit_spelling() {
+    async fn people_ids_resolve_for_every_credit_spelling(
+        #[case] name: &str,
+        #[case] variant: &str,
+    ) {
         let db = test_db().await;
         let movie = Uuid::from_u128(0xB_1234);
         seed_named_item(&db, movie, BaseItemKind::Movie, "M").await;
         let person = Uuid::from_u128(0xB_5678);
-        seed_named_item(&db, person, BaseItemKind::Person, "Leonardo DiCaprio").await;
+        seed_named_item(&db, person, BaseItemKind::Person, name).await;
         let person_row = fetch_item(&db, person).await;
         let item = fetch_item(&db, movie).await;
 
@@ -8044,7 +8075,7 @@ mod tests {
             people: vec![
                 PeopleEntity {
                     id: Uuid::new_v4().to_string(),
-                    name: "Leonardo DiCaprio".into(),
+                    name: name.into(),
                     person_type: Some("Actor".into()),
                     ..Default::default()
                 },
@@ -8052,7 +8083,7 @@ mod tests {
                 // by-name item backs both.
                 PeopleEntity {
                     id: Uuid::new_v4().to_string(),
-                    name: "leonardo dicaprio".into(),
+                    name: variant.into(),
                     person_type: Some("Director".into()),
                     ..Default::default()
                 },
@@ -8069,6 +8100,41 @@ mod tests {
         assert_eq!(people.len(), 2);
         assert_eq!(people[0].id, person, "first spelling");
         assert_eq!(people[1].id, person, "second spelling");
+    }
+
+    #[tokio::test]
+    async fn unicode_person_projection_keeps_distinct_clean_keys() {
+        let db = test_db().await;
+        let movie = Uuid::new_v4();
+        seed_named_item(&db, movie, BaseItemKind::Movie, "Movie").await;
+        let item = fetch_item(&db, movie).await;
+        let ids = [Uuid::new_v4(), Uuid::new_v4()];
+        let mut rows = Vec::new();
+        let mut credits = Vec::new();
+        // Full lowercase maps both to ος; invariant clean keys are οσ and ος.
+        for (id, name) in ids.into_iter().zip(["ΟΣ", "ος"]) {
+            seed_named_item(&db, id, BaseItemKind::Person, name).await;
+            rows.push(fetch_item(&db, id).await);
+            credits.push(PeopleEntity {
+                name: name.into(),
+                person_type: Some("Actor".into()),
+                ..Default::default()
+            });
+        }
+        let library = Arc::new(FakeLibrary {
+            people: credits,
+            named_items: rows,
+        });
+        let svc = service_with(db, library);
+        let dto = svc
+            .get_base_item_dto(&item, &DtoOptions::default(), None, None)
+            .await
+            .unwrap();
+        let people = dto.people.unwrap();
+        assert_eq!(
+            people.iter().map(|person| person.id).collect::<Vec<_>>(),
+            ids
+        );
     }
 
     /// The page's own images and the cast's images come out of ONE

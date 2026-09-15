@@ -61,6 +61,12 @@ const SHORTCUT_EXTENSION: &str = "mblink";
 /// The per-library options file name (JSON counterpart of C# `options.xml`).
 const OPTIONS_FILE: &str = "options.json";
 
+/// The per-library options file Jellyfin writes (`LibraryOptions` through
+/// `IXmlSerializer`). Read once, when an adopted library folder has no
+/// [`OPTIONS_FILE`] yet, and converted — see
+/// [`FerrofinVirtualFolderManager::load_options`].
+const JELLYFIN_OPTIONS_FILE: &str = "options.xml";
+
 /// The collection-marker file extension (`<type>.collection`).
 const COLLECTION_EXTENSION: &str = "collection";
 
@@ -463,46 +469,60 @@ impl FerrofinVirtualFolderManager {
     /// Reads the [`LibraryOptions`] stored in a folder's `options.json`, or the
     /// default when the file is absent or unreadable (matching C#
     /// `LoadLibraryOptions`, which falls back to `new LibraryOptions()`).
+    ///
+    /// An adopted Jellyfin library folder has no `options.json` but does have
+    /// Jellyfin's `options.xml`; that is imported once (the same one-way
+    /// `config/*.xml` import the configuration manager runs) and written out as
+    /// `options.json`, so the library keeps its metadata downloaders, image
+    /// fetchers and path settings instead of silently reverting to defaults.
+    /// The XML is never touched again, and an `options.json` that exists always
+    /// wins.
     async fn load_options(folder_path: &Path) -> LibraryOptions {
         let options_path = folder_path.join(OPTIONS_FILE);
         match tokio::fs::read(&options_path).await {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-            Err(_) => Self::adopt_options_xml(folder_path).await,
+            Err(_) => Self::adopt_jellyfin_options(folder_path)
+                .await
+                .unwrap_or_default(),
         }
     }
 
-    /// An adopted Jellyfin library carries its options as `options.xml`
-    /// (C# `IXmlSerializer`), not `options.json`. Import it over the defaults
-    /// the way `system.xml` is imported (every element Ferrofin does not model
-    /// is ignored, so 12.0's `SimilarItemProviders` and friends cost nothing),
-    /// write the result as `options.json` so the next read is native, and
-    /// keep the XML in place. Without this every adopted library silently ran
-    /// on default options — grouping on, no preferred language, default
-    /// providers — whatever the operator had configured.
-    async fn adopt_options_xml(folder_path: &Path) -> LibraryOptions {
-        let xml_path = folder_path.join("options.xml");
-        let Ok(xml) = tokio::fs::read_to_string(&xml_path).await else {
-            return LibraryOptions::default();
-        };
-        match crate::config_import::import_over(
+    /// Imports a Jellyfin `options.xml` beside a missing `options.json` and
+    /// persists the result as `options.json`. `None` when there is no XML; the
+    /// default (and a warning) when the XML cannot be read or converted, so one
+    /// damaged file never blocks listing the library.
+    async fn adopt_jellyfin_options(folder_path: &Path) -> Option<LibraryOptions> {
+        let xml_path = folder_path.join(JELLYFIN_OPTIONS_FILE);
+        let xml = tokio::fs::read_to_string(&xml_path).await.ok()?;
+        let imported = match crate::config_import::import_over(
             &LibraryOptions::default(),
             &xml,
             "LibraryOptions",
             &[],
         ) {
-            Ok(options) => {
-                if let Err(err) = Self::save_options(folder_path, &options).await {
-                    tracing::warn!(path = %xml_path.display(), %err, "adopted library options could not be persisted as JSON; re-importing on the next read");
-                } else {
-                    tracing::info!(path = %xml_path.display(), "adopted jellyfin library options");
-                }
-                options
-            }
+            Ok(options) => options,
             Err(err) => {
-                tracing::warn!(path = %xml_path.display(), %err, "library options.xml could not be imported; using defaults");
-                LibraryOptions::default()
+                tracing::warn!(
+                    path = %xml_path.display(),
+                    error = %err,
+                    "could not adopt the jellyfin library options; using defaults"
+                );
+                return Some(LibraryOptions::default());
             }
+        };
+        if let Err(err) = Self::save_options(folder_path, &imported).await {
+            tracing::warn!(
+                path = %folder_path.join(OPTIONS_FILE).display(),
+                error = %err,
+                "adopted jellyfin library options but could not persist them; they will be re-imported on the next read"
+            );
+        } else {
+            tracing::info!(
+                path = %xml_path.display(),
+                "adopted jellyfin library options"
+            );
         }
+        Some(imported)
     }
 
     /// Writes `options` to a folder's `options.json` (C# `SaveLibraryOptions`).
@@ -1207,6 +1227,176 @@ mod tests {
                 .await
                 .expect("count");
         assert_eq!(remaining, 0);
+    }
+
+    /// A `LibraryOptions` document as Jellyfin 10.11's `XmlSerializer` writes it
+    /// for a TV library with one path and hand-picked fetchers.
+    const JELLYFIN_OPTIONS_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<LibraryOptions xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <Enabled>true</Enabled>
+  <EnablePhotos>false</EnablePhotos>
+  <EnableRealtimeMonitor>true</EnableRealtimeMonitor>
+  <EnableLUFSScan>false</EnableLUFSScan>
+  <EnableChapterImageExtraction>true</EnableChapterImageExtraction>
+  <ExtractChapterImagesDuringLibraryScan>false</ExtractChapterImagesDuringLibraryScan>
+  <EnableTrickplayImageExtraction>true</EnableTrickplayImageExtraction>
+  <ExtractTrickplayImagesDuringLibraryScan>false</ExtractTrickplayImagesDuringLibraryScan>
+  <PathInfos>
+    <MediaPathInfo>
+      <Path>/srv/fastmedia/shows</Path>
+    </MediaPathInfo>
+  </PathInfos>
+  <SaveLocalMetadata>true</SaveLocalMetadata>
+  <EnableInternetProviders>true</EnableInternetProviders>
+  <EnableAutomaticSeriesGrouping>true</EnableAutomaticSeriesGrouping>
+  <EnableEmbeddedTitles>false</EnableEmbeddedTitles>
+  <EnableEmbeddedExtrasTitles>false</EnableEmbeddedExtrasTitles>
+  <EnableEmbeddedEpisodeInfos>false</EnableEmbeddedEpisodeInfos>
+  <AutomaticRefreshIntervalDays>30</AutomaticRefreshIntervalDays>
+  <PreferredMetadataLanguage>en</PreferredMetadataLanguage>
+  <MetadataCountryCode>GB</MetadataCountryCode>
+  <SeasonZeroDisplayName>Specials</SeasonZeroDisplayName>
+  <MetadataSavers>
+    <string>Nfo</string>
+  </MetadataSavers>
+  <DisabledLocalMetadataReaders />
+  <LocalMetadataReaderOrder>
+    <string>Nfo</string>
+  </LocalMetadataReaderOrder>
+  <DisabledSubtitleFetchers />
+  <SubtitleFetcherOrder />
+  <DisabledMediaSegmentProviders />
+  <MediaSegmentProvideOrder />
+  <SkipSubtitlesIfEmbeddedSubtitlesPresent>false</SkipSubtitlesIfEmbeddedSubtitlesPresent>
+  <SkipSubtitlesIfAudioTrackMatches>false</SkipSubtitlesIfAudioTrackMatches>
+  <SubtitleDownloadLanguages />
+  <RequirePerfectSubtitleMatch>true</RequirePerfectSubtitleMatch>
+  <SaveSubtitlesWithMedia>true</SaveSubtitlesWithMedia>
+  <SaveLyricsWithMedia>true</SaveLyricsWithMedia>
+  <SaveTrickplayWithMedia>false</SaveTrickplayWithMedia>
+  <DisabledLyricFetchers />
+  <LyricFetcherOrder />
+  <PreferNonstandardArtistsTag>false</PreferNonstandardArtistsTag>
+  <UseCustomTagDelimiters>false</UseCustomTagDelimiters>
+  <CustomTagDelimiters />
+  <DelimiterWhitelist />
+  <AutomaticallyAddToCollection>false</AutomaticallyAddToCollection>
+  <AllowEmbeddedSubtitles>AllowAll</AllowEmbeddedSubtitles>
+  <TypeOptions>
+    <TypeOptions>
+      <Type>Series</Type>
+      <MetadataFetchers>
+        <string>TheMovieDb</string>
+        <string>The Open Movie Database</string>
+      </MetadataFetchers>
+      <MetadataFetcherOrder>
+        <string>TheMovieDb</string>
+        <string>The Open Movie Database</string>
+      </MetadataFetcherOrder>
+      <ImageFetchers>
+        <string>TheMovieDb</string>
+      </ImageFetchers>
+      <ImageFetcherOrder>
+        <string>TheMovieDb</string>
+      </ImageFetcherOrder>
+      <ImageOptions>
+        <ImageOption>
+          <Type>Primary</Type>
+          <Limit>1</Limit>
+          <MinWidth>0</MinWidth>
+        </ImageOption>
+      </ImageOptions>
+    </TypeOptions>
+  </TypeOptions>
+</LibraryOptions>"#;
+
+    #[tokio::test]
+    async fn adopted_jellyfin_options_xml_is_imported_once_and_persisted_as_json() {
+        let (tmp, mgr) = manager();
+        // An adopted Jellyfin library folder: shortcut + marker + options.xml,
+        // no options.json.
+        let folder = tmp.path().join("default").join("Shows");
+        std::fs::create_dir_all(&folder).expect("folder");
+        std::fs::write(folder.join("shows.mblink"), "/srv/fastmedia/shows").expect("mblink");
+        std::fs::write(folder.join("tvshows.collection"), "").expect("marker");
+        std::fs::write(
+            folder.join(super::JELLYFIN_OPTIONS_FILE),
+            JELLYFIN_OPTIONS_XML,
+        )
+        .expect("xml");
+
+        let folders = mgr.get_virtual_folders().await.expect("list");
+        assert_eq!(folders.len(), 1);
+        let options = folders[0].library_options.clone().expect("options");
+        // Scalars, strings, optionals.
+        assert!(!options.enable_photos, "EnablePhotos=false carried");
+        assert!(options.enable_realtime_monitor);
+        assert_eq!(options.automatic_refresh_interval_days, 30);
+        assert_eq!(options.preferred_metadata_language.as_deref(), Some("en"));
+        assert_eq!(options.metadata_country_code.as_deref(), Some("GB"));
+        assert_eq!(options.season_zero_display_name, "Specials");
+        // A one-entry class-typed list (the common single-path library).
+        assert_eq!(options.path_infos.len(), 1);
+        assert_eq!(options.path_infos[0].path, "/srv/fastmedia/shows");
+        // String lists, empty and populated.
+        assert_eq!(
+            options.metadata_savers.as_deref(),
+            Some(&["Nfo".to_owned()][..])
+        );
+        assert!(options.disabled_local_metadata_readers.is_empty());
+        // The nested per-type table with its own lists and ImageOption entries.
+        assert_eq!(options.type_options.len(), 1);
+        let series = &options.type_options[0];
+        assert_eq!(series.type_.as_deref(), Some("Series"));
+        assert_eq!(
+            series.metadata_fetchers,
+            ["TheMovieDb", "The Open Movie Database"]
+        );
+        assert_eq!(series.image_fetchers, ["TheMovieDb"]);
+        assert_eq!(series.image_options.len(), 1);
+        assert_eq!(series.image_options[0].limit, 1);
+
+        // Persisted as options.json; the XML is untouched.
+        let json_path = folder.join(super::OPTIONS_FILE);
+        assert!(json_path.exists(), "options.json written on adoption");
+        assert_eq!(
+            std::fs::read_to_string(folder.join(super::JELLYFIN_OPTIONS_FILE)).expect("xml"),
+            JELLYFIN_OPTIONS_XML
+        );
+        // From now on the JSON wins: edit it, and the XML is no longer consulted.
+        let mut edited: LibraryOptions =
+            serde_json::from_slice(&std::fs::read(&json_path).expect("json")).expect("parse");
+        edited.season_zero_display_name = "Extras".to_owned();
+        std::fs::write(&json_path, serde_json::to_vec(&edited).expect("ser")).expect("write");
+        let again = mgr.get_virtual_folders().await.expect("list");
+        assert_eq!(
+            again[0]
+                .library_options
+                .as_ref()
+                .expect("options")
+                .season_zero_display_name,
+            "Extras"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_damaged_jellyfin_options_xml_yields_defaults_without_failing_the_listing() {
+        let (tmp, mgr) = manager();
+        let folder = tmp.path().join("default").join("Broken");
+        std::fs::create_dir_all(&folder).expect("folder");
+        std::fs::write(
+            folder.join(super::JELLYFIN_OPTIONS_FILE),
+            "<NotLibraryOptions/>",
+        )
+        .expect("xml");
+        let folders = mgr.get_virtual_folders().await.expect("list");
+        assert_eq!(folders.len(), 1);
+        assert_eq!(
+            folders[0].library_options,
+            Some(LibraryOptions::default()),
+            "unreadable XML falls back to defaults"
+        );
+        assert!(!folder.join(super::OPTIONS_FILE).exists());
     }
 
     #[tokio::test]

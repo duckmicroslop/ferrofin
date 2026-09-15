@@ -1359,6 +1359,12 @@ impl ServerApplicationHost for FakeAppHost {
     async fn get_smart_api_url(&self, _request: &RequestContext) -> Result<String, ServiceError> {
         unimplemented!("fake")
     }
+    async fn get_smart_api_url_for_peer(
+        &self,
+        _peer: std::net::IpAddr,
+    ) -> Result<String, ServiceError> {
+        self.get_smart_api_url(&RequestContext::default()).await
+    }
     async fn get_local_api_url(
         &self,
         _hostname: &str,

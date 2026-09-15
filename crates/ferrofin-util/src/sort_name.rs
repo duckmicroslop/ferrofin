@@ -3,7 +3,7 @@
 //! with Jellyfin's default `SortRemoveWords` / `SortRemoveCharacters` /
 //! `SortReplaceCharacters`.
 
-use crate::string_extensions::remove_diacritics;
+use crate::string_extensions::{lower_invariant, remove_diacritics};
 
 /// `ServerConfiguration.SortRemoveWords` — leading/interior/trailing articles.
 const SORT_REMOVE_WORDS: [&str; 3] = ["the", "a", "an"];
@@ -21,7 +21,7 @@ const SORT_REPLACE_CHARACTERS: [char; 3] = ['.', '+', '%'];
 ///
 /// With `enable_alpha_numeric_sorting` off (only `Person` overrides it to
 /// `false`) the answer is `name.TrimStart()` — the name verbatim. Otherwise:
-/// trim and lower-case, remove each article where it stands as a whole word
+/// trim and lower-case (.NET invariant simple casing), remove each article where it stands as a whole word
 /// (at the start, surrounded by spaces, or at the end), delete the
 /// remove-character set, turn each replace-character into a space, then
 /// [`modify_sort_chunks`] left-pads every run of digits to 10 so numbers sort
@@ -34,10 +34,34 @@ const SORT_REPLACE_CHARACTERS: [char; 3] = ['.', '+', '%'];
 /// articles while the `.` is still attached, so nothing matches.
 #[must_use]
 pub fn get_sort_name(name: &str, enable_alpha_numeric_sorting: bool) -> String {
+    get_sort_name_with(name, enable_alpha_numeric_sorting, lower_invariant)
+}
+
+/// The derivation before invariant casing (full Unicode `to_lowercase`), kept
+/// only so migration `0031` can recognise keys Ferrofin wrote with it. Never
+/// use it for a new write or a query parameter.
+#[must_use]
+pub fn previous_create_sort_name(name: &str) -> String {
+    get_sort_name_with(name, true, str::to_lowercase)
+}
+
+/// The 10.11.8-era forced key — `ModifySortChunks(ForcedSortName)` through
+/// full Unicode `to_lowercase` — kept only so migration `0031` can recognise
+/// stored values written with it.
+#[must_use]
+pub fn previous_forced_sort_key(forced: &str) -> String {
+    modify_sort_chunks(forced).to_lowercase()
+}
+
+fn get_sort_name_with(
+    name: &str,
+    enable_alpha_numeric_sorting: bool,
+    lowercase: fn(&str) -> String,
+) -> String {
     if !enable_alpha_numeric_sorting {
         return name.trim_start().to_owned();
     }
-    let mut sortable = name.trim().to_lowercase();
+    let mut sortable = lowercase(name.trim());
     for search in SORT_REMOVE_WORDS {
         if let Some(rest) = sortable.strip_prefix(&format!("{search} ")) {
             sortable = rest.to_owned();

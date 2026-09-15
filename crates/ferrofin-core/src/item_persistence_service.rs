@@ -3575,6 +3575,34 @@ mod tests {
         assert_eq!(name.as_deref(), Some("Renamed.File.2011"));
     }
 
+    /// A key written with Rust's full lowercase (`ΟΣ` → `ος`, final-sigma
+    /// context) is rewritten with .NET's simple invariant casing, and the
+    /// 12.0 punctuation rule applies in the same pass.
+    #[tokio::test]
+    async fn the_clean_value_repair_uses_invariant_casing_and_the_12_0_form() {
+        let db = test_db().await;
+        let id = Uuid::new_v4();
+        crate::test_support::seed_named_item(&db, id, BaseItemKind::Person, "ΟΣ.").await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "CleanName" = 'ος' WHERE "Id" = ?1"#)
+            .bind(ferrofin_db::store::guid_to_db(id))
+            .execute(db.writer())
+            .await
+            .unwrap();
+        let service = FerrofinItemPersistenceService::new(db.clone());
+        // Two rows: this one and the detached-UserData placeholder item `0032`
+        // seeds with no `CleanName`.
+        assert_eq!(service.repair_clean_values().await.unwrap(), 2);
+        let clean: String =
+            sqlx::query_scalar(r#"SELECT "CleanName" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(ferrofin_db::store::guid_to_db(id))
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        // 12.0's rule: simple invariant lowercase (no final-sigma context), then
+        // punctuation to space and trim — so the dot goes too.
+        assert_eq!(clean, "οσ");
+    }
+
     /// The port of 12.0's `RefreshCleanNamesAndValues`: a database written
     /// under 10.11.8's rule (fold + lower-case, punctuation kept) is moved to
     /// the 12.0 form once, names and values alike, and a second boot does

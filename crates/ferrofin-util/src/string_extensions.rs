@@ -233,7 +233,7 @@ pub fn get_clean_value(value: &str) -> String {
     if value.trim().is_empty() {
         return value.to_owned();
     }
-    let cleaned = remove_diacritics(value).to_lowercase();
+    let cleaned = lower_invariant(&remove_diacritics(value));
     let cleaned = NOT_LETTER_DIGIT_SPACE.replace_all(&cleaned, " ");
     WHITESPACE_RUN.replace_all(&cleaned, " ").trim().to_owned()
 }
@@ -253,26 +253,40 @@ pub fn equals_ordinal_ignore_case(left: &str, right: &str) -> bool {
         .eq(right.chars().map(to_upper_invariant))
 }
 
-/// `string.ToUpperInvariant()` — every character through the *simple*
-/// one-to-one uppercase mapping. A character whose full uppercase form is
-/// longer than one character (`ß` → `SS`, `ﬁ` → `FI`) is kept as it is, which
-/// is exactly what .NET does and what Rust's `str::to_uppercase` does not.
-///
-/// This is the key Jellyfin 12.0 stores in `Users.NormalizedUsername` and
-/// matches usernames on, so every lookup and every write must go through it.
+/// .NET invariant uppercase for a string, using ICU's simple mappings.
 #[must_use]
 pub fn upper_invariant(text: &str) -> String {
+    if text.is_ascii() {
+        return text.to_ascii_uppercase();
+    }
     text.chars().map(to_upper_invariant).collect()
 }
 
-/// `char.ToUpperInvariant` — the *simple* mapping, which by definition maps one
-/// character to one character. Rust's `char::to_uppercase` is the full mapping,
-/// so a character whose uppercase form is longer is left as it is.
+/// .NET invariant lowercase for a string, using ICU's simple mappings.
+#[must_use]
+pub fn lower_invariant(text: &str) -> String {
+    if text.is_ascii() {
+        return text.to_ascii_lowercase();
+    }
+    let mapper = icu_casemap::CaseMapper::new();
+    text.chars()
+        // .NET ChangeCaseInvariant preserves capital dotted I.
+        .map(|c| {
+            if c == '\u{0130}' {
+                c
+            } else {
+                mapper.simple_lowercase(c)
+            }
+        })
+        .collect()
+}
+
 fn to_upper_invariant(c: char) -> char {
-    let mut upper = c.to_uppercase();
-    match (upper.next(), upper.next()) {
-        (Some(single), None) => single,
-        _ => c,
+    // .NET ChangeCaseInvariant preserves dotless i, unlike Unicode's default.
+    if c == '\u{0131}' {
+        c
+    } else {
+        icu_casemap::CaseMapper::new().simple_uppercase(c)
     }
 }
 
@@ -280,6 +294,65 @@ fn to_upper_invariant(c: char) -> char {
 mod tests {
     use super::*;
     use rstest::rstest;
+
+    #[test]
+    fn invariant_casing_matches_dotnet_for_every_unicode_scalar() {
+        let mappings: std::collections::HashMap<u32, (u32, u32)> =
+            include_str!("../tests/data/dotnet-invariant-casing.tsv")
+                .lines()
+                .filter(|line| !line.starts_with('#'))
+                .map(|line| {
+                    let values: Vec<u32> = line
+                        .split_whitespace()
+                        .map(|n| u32::from_str_radix(n, 16).unwrap())
+                        .collect();
+                    (values[0], (values[1], values[2]))
+                })
+                .collect();
+        for scalar in 0..=0x0010_ffff {
+            let Some(c) = char::from_u32(scalar) else {
+                continue;
+            };
+            let (upper, lower) = mappings.get(&scalar).copied().unwrap_or((scalar, scalar));
+            let text = c.to_string();
+            assert_eq!(
+                upper_invariant(&text),
+                char::from_u32(upper).unwrap().to_string(),
+                "uppercase U+{scalar:04X}"
+            );
+            assert_eq!(
+                lower_invariant(&text),
+                char::from_u32(lower).unwrap().to_string(),
+                "lowercase U+{scalar:04X}"
+            );
+        }
+    }
+
+    // .NET invariant casing: expansions, contextual casing and Unicode
+    // normalization must not be introduced by a library upgrade.
+    #[rstest]
+    #[case("alice", "ALICE", "alice")]
+    #[case("münchen", "MÜNCHEN", "münchen")]
+    #[case("Ñoño", "ÑOÑO", "ñoño")]
+    #[case("iIİı", "IIİı", "iiİı")]
+    #[case("straßeẞ", "STRAßEẞ", "straßeß")]
+    #[case("ﬃ", "ﬃ", "ﬃ")]
+    #[case("σςΣ", "ΣΣΣ", "σςσ")]
+    #[case("ᾀ", "ᾈ", "ᾀ")]
+    #[case("Привет", "ПРИВЕТ", "привет")]
+    #[case("աբգ", "ԱԲԳ", "աբգ")]
+    #[case("აბგ", "ᲐᲑᲒ", "აბგ")]
+    #[case("𐐨𐐀", "𐐀𐐀", "𐐨𐐨")]
+    #[case("é e\u{301}", "É E\u{301}", "é e\u{301}")]
+    #[case("aа", "AА", "aа")]
+    #[case("中文🙂", "中文🙂", "中文🙂")]
+    #[case("", "", "")]
+    fn invariant_casing(#[case] input: &str, #[case] upper: &str, #[case] lower: &str) {
+        assert_eq!(upper_invariant(input), upper);
+        assert_eq!(lower_invariant(input), lower);
+        assert_eq!(upper_invariant(upper), upper);
+        assert_eq!(lower_invariant(lower), lower);
+    }
 
     #[rstest]
     #[case("", "")] // Identity edge-case (no diacritics)
@@ -409,6 +482,10 @@ mod tests {
     #[case("Mötley Crüe: Greatest Hits!", "motley crue greatest hits")]
     #[case("H. Jon Benjamin", "h jon benjamin")]
     #[case("Warner Bros. Pictures", "warner bros pictures")]
+    #[case("ΟΣ", "οσ")] // simple casing: no final-sigma context
+    #[case("𐐀", "𐐨")]
+    #[case("Béla   Tarr!!", "bela tarr")] // fold, lowercase, punctuation to space, collapse
+    #[case("A,B;C", "a b c")]
     #[case(
         "Spider-Man: Across the Spider-Verse",
         "spider man across the spider verse"

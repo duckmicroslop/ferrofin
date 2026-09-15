@@ -142,7 +142,9 @@ impl MediaExtractor for FfmpegMediaExtractor {
         // Little-endian s16 pairs → samples (a trailing odd byte is decoder
         // noise; drop it rather than failing the window).
         Ok(bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|b| i16::from_le_bytes([b[0], b[1]]))
             .collect())
     }

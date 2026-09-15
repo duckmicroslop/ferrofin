@@ -53,9 +53,10 @@ UPDATE "BaseItems" SET "PrimaryVersionId" = NULL
 -- NOT NULL in the rebuild below.
 DELETE FROM "Permissions" WHERE "UserId" IS NULL;
 DELETE FROM "Preferences" WHERE "UserId" IS NULL;
--- 20260522092303/4 NormalizedUsername: the column is filled with SQL upper() here
--- (ASCII); the boot backfill in ferrofin-core re-derives it with the invariant
--- Unicode uppercase for names SQL got wrong.
+-- 20260522092303/4 NormalizedUsername: `0030` owns the column (or it is
+-- baselined where Jellyfin already created it), so the rebuild carries the
+-- stored key across unchanged — the ICU backfill that runs after every
+-- migration pass has either written it already or writes it right after.
 
 -- ── Users: rebuild to the 12.0 shape ─────────────────────────────
 CREATE TABLE "Users_jf"(
@@ -94,7 +95,7 @@ CREATE TABLE "Users_jf"(
   "NormalizedUsername" TEXT NOT NULL DEFAULT ''
 );
 INSERT INTO "Users_jf" ("Id", "AudioLanguagePreference", "AuthenticationProviderId", "CastReceiverId", "DisplayCollectionsView", "DisplayMissingEpisodes", "EnableAutoLogin", "EnableLocalPassword", "EnableNextEpisodeAutoPlay", "EnableUserPreferenceAccess", "HidePlayedInLatest", "InternalId", "InvalidLoginAttemptCount", "LastActivityDate", "LastLoginDate", "LoginAttemptsBeforeLockout", "MaxActiveSessions", "MaxParentalRatingScore", "MustUpdatePassword", "Password", "PasswordResetProviderId", "PlayDefaultAudioTrack", "RememberAudioSelections", "RememberSubtitleSelections", "RemoteClientBitrateLimit", "RowVersion", "SubtitleLanguagePreference", "SubtitleMode", "SyncPlayAccess", "Username", "MaxParentalRatingSubScore", "NormalizedUsername")
-SELECT "Id", "AudioLanguagePreference", "AuthenticationProviderId", "CastReceiverId", "DisplayCollectionsView", "DisplayMissingEpisodes", "EnableAutoLogin", "EnableLocalPassword", "EnableNextEpisodeAutoPlay", "EnableUserPreferenceAccess", "HidePlayedInLatest", "InternalId", "InvalidLoginAttemptCount", "LastActivityDate", "LastLoginDate", "LoginAttemptsBeforeLockout", "MaxActiveSessions", "MaxParentalRatingScore", "MustUpdatePassword", "Password", "PasswordResetProviderId", "PlayDefaultAudioTrack", "RememberAudioSelections", "RememberSubtitleSelections", "RemoteClientBitrateLimit", "RowVersion", "SubtitleLanguagePreference", "SubtitleMode", "SyncPlayAccess", "Username", "MaxParentalRatingSubScore", upper("Username") FROM "Users";
+SELECT "Id", "AudioLanguagePreference", "AuthenticationProviderId", "CastReceiverId", "DisplayCollectionsView", "DisplayMissingEpisodes", "EnableAutoLogin", "EnableLocalPassword", "EnableNextEpisodeAutoPlay", "EnableUserPreferenceAccess", "HidePlayedInLatest", "InternalId", "InvalidLoginAttemptCount", "LastActivityDate", "LastLoginDate", "LoginAttemptsBeforeLockout", "MaxActiveSessions", "MaxParentalRatingScore", "MustUpdatePassword", "Password", "PasswordResetProviderId", "PlayDefaultAudioTrack", "RememberAudioSelections", "RememberSubtitleSelections", "RemoteClientBitrateLimit", "RowVersion", "SubtitleLanguagePreference", "SubtitleMode", "SyncPlayAccess", "Username", "MaxParentalRatingSubScore", "NormalizedUsername" FROM "Users";
 DROP TABLE "Users";
 ALTER TABLE "Users_jf" RENAME TO "Users";
 CREATE UNIQUE INDEX "IX_Users_NormalizedUsername" ON "Users"(

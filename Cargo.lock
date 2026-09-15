@@ -1203,6 +1203,7 @@ dependencies = [
  "ferrofin-model",
  "ferrofin-util",
  "libsqlite3-sys",
+ "rstest",
  "serde",
  "sqlx",
  "tempfile",
@@ -1405,6 +1406,8 @@ dependencies = [
  "ferrofin-common",
  "ferrofin-model",
  "ferrofin-util",
+ "if-addrs",
+ "libc",
  "rstest",
  "serde",
  "serde_json",
@@ -1505,6 +1508,7 @@ dependencies = [
 name = "ferrofin-util"
 version = "0.4.1"
 dependencies = [
+ "icu_casemap",
  "rand 0.8.7",
  "regex",
  "rstest",
@@ -2090,6 +2094,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "icu_casemap"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "070f98b5b82798fcb93654bf96ed9f40064fc44c86f51a09ea711092cd5cc5be"
+dependencies = [
+ "icu_casemap_data",
+ "icu_collections",
+ "icu_locale_core",
+ "icu_properties",
+ "icu_provider",
+ "potential_utf",
+ "writeable",
+ "zerovec",
+]
+
+[[package]]
+name = "icu_casemap_data"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "846b0857ca091204be3c874bc93daaf89d4777e8d2d20b0d3ffe8f671d98014b"
+
+[[package]]
 name = "icu_collator"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2122,6 +2148,7 @@ checksum = "2984d1cd16c883d7935b9e07e44071dca8d917fd52ecc02c04d5fa0b5a3f191c"
 dependencies = [
  "displaydoc",
  "potential_utf",
+ "serde",
  "utf8_iter",
  "yoke",
  "zerofrom",
@@ -2248,6 +2275,16 @@ checksum = "cb68373c0d6620ef8105e855e7745e18b0d00d3bdb07fb532e434244cdb9a714"
 dependencies = [
  "icu_normalizer",
  "icu_properties",
+]
+
+[[package]]
+name = "if-addrs"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0a05c691e1fae256cf7013d99dad472dc52d5543322761f83ec8d47eab40d2b"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

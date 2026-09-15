@@ -16,7 +16,35 @@ pub struct ServerDiscoveryInfo {
     /// Gets the name.
     pub name: String,
 
-    /// Gets the endpoint address.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Gets the endpoint address (explicitly null in UDP discovery replies).
     pub endpoint_address: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn discovery_serializes_all_four_keys_including_null_endpoint() {
+        let response = ServerDiscoveryInfo {
+            address: "http://192.168.1.2:8096".into(),
+            id: "persisted-server-id".into(),
+            name: "Living room".into(),
+            endpoint_address: None,
+        };
+        let json = serde_json::to_value(&response).expect("serialize discovery");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "Address": "http://192.168.1.2:8096",
+                "Id": "persisted-server-id",
+                "Name": "Living room",
+                "EndpointAddress": null,
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ServerDiscoveryInfo>(json).expect("deserialize discovery"),
+            response
+        );
+    }
 }

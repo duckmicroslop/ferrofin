@@ -140,9 +140,11 @@ impl Database {
         if let Some(path) = &file_path {
             use sqlx::ConnectOptions;
             let mut conn = write_options.clone().foreign_keys(false).connect().await?;
+            crate::normalized_usernames::preflight(&mut conn).await?;
             adopt_jellyfin_database(&mut conn, path).await?;
             backup_before_rebuild(&mut conn, path).await?;
             MIGRATOR.run(&mut conn).await?;
+            crate::normalized_usernames::repair(&mut conn).await?;
             foreign_key_check(&mut conn).await?;
             sqlx::Connection::close(conn).await?;
         }
@@ -236,7 +238,25 @@ impl Database {
         // to. `MIGRATOR.run` is idempotent, so this logs the target head, not
         // necessarily a newly-applied set.
         let head = MIGRATOR.iter().last().map(|m| m.version);
-        MIGRATOR.run(&self.writer).await?;
+        {
+            let mut conn = self.writer.acquire().await?;
+            crate::normalized_usernames::preflight(&mut conn).await?;
+            // Same rule as the file path above: a table rebuild (`0007`,
+            // `0032`) must not cascade-delete child rows, so foreign keys go
+            // OFF for the run — outside any transaction — and back ON after.
+            // The in-memory test database is the one that actually migrates
+            // here, and a test seeding rows between two chain heads would
+            // otherwise lose them exactly as a real upgrade would with FKs on.
+            sqlx::query("PRAGMA foreign_keys = OFF")
+                .execute(&mut *conn)
+                .await?;
+            let run = MIGRATOR.run(&mut *conn).await;
+            sqlx::query("PRAGMA foreign_keys = ON")
+                .execute(&mut *conn)
+                .await?;
+            run?;
+            crate::normalized_usernames::repair(&mut conn).await?;
+        }
         tracing::info!(
             migrations = MIGRATOR.iter().count(),
             head,
@@ -993,6 +1013,16 @@ const JELLYFIN_12_0_MIGRATIONS: [&str; 102] = [
     "20260831100000_EnableLocalSimilarityProviders",
 ];
 
+/// The three ids Jellyfin 10.11.10 and 10.11.11 add on top of
+/// [`JELLYFIN_10_11_8_MIGRATIONS`] (10.11.9 adds none): the `NormalizedUsername`
+/// column, its backfill and its unique index — exactly what Ferrofin's `0030`
+/// creates, so that generation baselines `0030` as well.
+const JELLYFIN_10_11_X_ADDITIVE_MIGRATIONS: [&str; 3] = [
+    "20260522092303_AddNormalizedUsername",
+    "20260522092304_UpdateNormalizedUsername",
+    "20260524120336_AddUniqueNormalizedUsernameIndex",
+];
+
 /// A Jellyfin schema generation Ferrofin adopts in place.
 ///
 /// Adoption is gated on the **exact** `__EFMigrationsHistory` id set a real
@@ -1002,36 +1032,62 @@ const JELLYFIN_12_0_MIGRATIONS: [&str; 102] = [
 /// without executing; every other migration runs.
 #[derive(Debug, Clone, Copy)]
 pub struct JellyfinGeneration {
-    /// The release name, as shown in logs and errors (`"10.11.8"`, `"12.0.0"`).
+    /// The release name, as shown in logs and errors (`"10.11.8"`, `"10.11.11"`, `"12.0.0"`).
     pub name: &'static str,
-    /// The sorted EF migration-id set of that release.
+    /// The EF migration-id set of that release (with [`Self::additional_ids`]).
     pub migration_ids: &'static [&'static str],
+    /// Ids a point release added on top of `migration_ids` (10.11.10/11 over
+    /// 10.11.8); empty for a release captured whole.
+    pub additional_ids: &'static [&'static str],
     /// Ferrofin migrations baselined (recorded, never run) for that generation.
     pub baselined_versions: &'static [i64],
 }
 
-/// The generations Ferrofin adopts. `0033` is never baselined: it is the
-/// Ferrofin-side convergence and must run on every path.
-pub const JELLYFIN_GENERATIONS: [JellyfinGeneration; 2] = [
+/// The generations Ferrofin adopts. `0001`–`0007` are the 10.11.8 shape every
+/// generation already has; `0030` (the `NormalizedUsername` column and index)
+/// is baselined wherever the database already owns it, `0032` (the 12.0
+/// shape) only for 12.0. `0031`, `0033` and `0034` are never baselined: they
+/// are data-only or Ferrofin-side convergence and must run on every path.
+pub const JELLYFIN_GENERATIONS: [JellyfinGeneration; 3] = [
     JellyfinGeneration {
         name: "10.11.8",
         migration_ids: &JELLYFIN_10_11_8_MIGRATIONS,
+        additional_ids: &[],
         baselined_versions: &[1, 2, 3, 4, 5, 6, 7],
+    },
+    JellyfinGeneration {
+        name: "10.11.11",
+        migration_ids: &JELLYFIN_10_11_8_MIGRATIONS,
+        additional_ids: &JELLYFIN_10_11_X_ADDITIVE_MIGRATIONS,
+        baselined_versions: &[1, 2, 3, 4, 5, 6, 7, 30],
     },
     JellyfinGeneration {
         name: "12.0.0",
         migration_ids: &JELLYFIN_12_0_MIGRATIONS,
-        baselined_versions: &[1, 2, 3, 4, 5, 6, 7, 32],
+        additional_ids: &[],
+        baselined_versions: &[1, 2, 3, 4, 5, 6, 7, 30, 32],
     },
 ];
 
+impl JellyfinGeneration {
+    /// The complete, sorted id set of the release.
+    fn ids(&self) -> Vec<&'static str> {
+        let mut ids: Vec<&str> = self
+            .migration_ids
+            .iter()
+            .chain(self.additional_ids)
+            .copied()
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+}
+
 /// The generation whose id set equals `applied` (sorted), if any.
 fn match_generation(applied: &[String]) -> Option<&'static JellyfinGeneration> {
-    JELLYFIN_GENERATIONS.iter().find(|g| {
-        let mut ids = g.migration_ids.to_vec();
-        ids.sort_unstable();
-        applied.iter().map(String::as_str).eq(ids.iter().copied())
-    })
+    JELLYFIN_GENERATIONS
+        .iter()
+        .find(|g| applied.iter().map(String::as_str).eq(g.ids()))
 }
 
 /// The refusal for an EF history that matches no generation, reported against
@@ -1041,15 +1097,15 @@ fn unsupported_generation(applied: &[String]) -> crate::DbError {
     let (closest, missing, extra) = JELLYFIN_GENERATIONS
         .iter()
         .map(|g| {
-            let missing: Vec<&str> = g
-                .migration_ids
+            let ids = g.ids();
+            let missing: Vec<&str> = ids
                 .iter()
                 .filter(|e| !applied.iter().any(|a| a == *e))
                 .copied()
                 .collect();
             let extra: Vec<&str> = applied
                 .iter()
-                .filter(|a| !g.migration_ids.contains(&a.as_str()))
+                .filter(|a| !ids.contains(&a.as_str()))
                 .map(String::as_str)
                 .collect();
             (g, missing, extra)
@@ -1065,7 +1121,7 @@ fn unsupported_generation(applied: &[String]) -> crate::DbError {
              bring the database to one of them first (or restore a backup)",
             applied.len(),
             closest.name,
-            closest.migration_ids.len(),
+            closest.ids().len(),
         ),
     }
 }
@@ -1461,6 +1517,7 @@ fn configure_sqlite_for_concurrency() {
         // auto-extension initializes SQLite, and `sqlite3_config` is refused
         // once that has happened.
         crate::sqlite_random::register_random_function();
+        crate::sqlite_casing::register();
     });
 }
 
@@ -2263,8 +2320,19 @@ mod tests {
             );
             assert!(generation.baselined_versions.contains(&7));
         }
-        assert!(JELLYFIN_GENERATIONS[1].baselined_versions.contains(&32));
-        assert!(!JELLYFIN_GENERATIONS[0].baselined_versions.contains(&32));
+        let by_name = |name: &str| {
+            JELLYFIN_GENERATIONS
+                .iter()
+                .find(|g| g.name == name)
+                .expect("generation")
+        };
+        assert!(by_name("12.0.0").baselined_versions.contains(&32));
+        assert!(!by_name("10.11.8").baselined_versions.contains(&32));
+        assert!(!by_name("10.11.11").baselined_versions.contains(&32));
+        // `0030` is baselined exactly where Jellyfin already owns the column.
+        assert!(!by_name("10.11.8").baselined_versions.contains(&30));
+        assert!(by_name("10.11.11").baselined_versions.contains(&30));
+        assert!(by_name("12.0.0").baselined_versions.contains(&30));
     }
 
     #[tokio::test]
@@ -2310,6 +2378,288 @@ mod tests {
         Database::connect_sized(&url, Some(2))
             .await
             .expect("re-open after adoption");
+    }
+
+    /// Applies the two 10.11.10 schema steps to a seeded 10.11.8 fixture, the
+    /// way EF Core does (`AddColumn` with a default, then the unique index).
+    async fn add_normalized_username(path: &std::path::Path) {
+        use sqlx::ConnectOptions;
+        let mut conn = SqliteConnectOptions::new()
+            .filename(path)
+            .connect()
+            .await
+            .expect("open fixture db");
+        sqlx::raw_sql(
+            r#"ALTER TABLE "Users" ADD "NormalizedUsername" TEXT NOT NULL DEFAULT '';
+               UPDATE "Users" SET "NormalizedUsername" = 'MÜNCHEN' WHERE "Id" = 'original';
+               CREATE UNIQUE INDEX "IX_Users_NormalizedUsername"
+                   ON "Users" ("NormalizedUsername");"#,
+        )
+        .execute(&mut conn)
+        .await
+        .expect("apply 10.11.10 additions");
+        sqlx::Connection::close(conn).await.expect("close");
+    }
+
+    #[rstest::rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn adoption_converges_old_and_new_username_schemas(#[case] newer: bool) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        let mut ids = JELLYFIN_10_11_8_MIGRATIONS.to_vec();
+        if newer {
+            ids.extend(JELLYFIN_10_11_X_ADDITIVE_MIGRATIONS);
+        }
+        seed_jellyfin_fixture(&path, &ids).await;
+        {
+            use sqlx::ConnectOptions;
+            let mut conn = SqliteConnectOptions::new()
+                .filename(&path)
+                .connect()
+                .await
+                .unwrap();
+            sqlx::query(r#"INSERT INTO "Users"
+                ("Id","AuthenticationProviderId","DisplayCollectionsView","DisplayMissingEpisodes",
+                 "EnableAutoLogin","EnableLocalPassword","EnableNextEpisodeAutoPlay",
+                 "EnableUserPreferenceAccess","HidePlayedInLatest","InternalId",
+                 "InvalidLoginAttemptCount","MaxActiveSessions","MustUpdatePassword",
+                 "PasswordResetProviderId","PlayDefaultAudioTrack","RememberAudioSelections",
+                 "RememberSubtitleSelections","RowVersion","SubtitleMode","SyncPlayAccess","Username","Password")
+                VALUES ('original','auth',0,0,0,0,1,1,1,1,0,0,0,'reset',1,1,1,0,0,0,'münchen','original-hash')"#)
+                .execute(&mut conn).await.unwrap();
+            sqlx::Connection::close(conn).await.unwrap();
+        }
+        if newer {
+            add_normalized_username(&path).await;
+        }
+
+        let url = format!("sqlite://{}", path.display());
+        let db = Database::connect_sized(&url, Some(2))
+            .await
+            .expect("adoption succeeds");
+
+        // The normalized key and its unique index survive adoption.
+        let column: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM pragma_table_info('Users') WHERE name = 'NormalizedUsername'",
+        )
+        .fetch_optional(db.pool())
+        .await
+        .expect("column probe");
+        assert!(
+            column.is_some(),
+            "NormalizedUsername column must be retained"
+        );
+        let index: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' \
+             AND name = 'IX_Users_NormalizedUsername'",
+        )
+        .fetch_optional(db.pool())
+        .await
+        .expect("index probe");
+        assert!(
+            index.is_some(),
+            "IX_Users_NormalizedUsername must be retained"
+        );
+
+        // Jellyfin's own bookkeeping stays untouched (71 rows), and the
+        // pre-adoption copy holds the original.
+        let ef_rows: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM "__EFMigrationsHistory""#)
+            .fetch_one(db.pool())
+            .await
+            .expect("ef rows");
+        assert_eq!(ef_rows, if newer { 71 } else { 68 });
+        let original: (String, String, String) = sqlx::query_as(
+            "SELECT Id, Username, Password FROM Users WHERE NormalizedUsername = 'MÜNCHEN'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            original,
+            ("original".into(), "münchen".into(), "original-hash".into())
+        );
+        assert!(path.with_extension("db.pre-ferrofin").exists());
+
+        // New accounts populate the normalized key and do not collide.
+        for (id, name) in [("A", "alice"), ("B", "bob")] {
+            sqlx::query(
+                r#"INSERT INTO "Users" ("Id","AuthenticationProviderId","DisplayCollectionsView",
+                   "DisplayMissingEpisodes","EnableAutoLogin","EnableLocalPassword",
+                   "EnableNextEpisodeAutoPlay","EnableUserPreferenceAccess","HidePlayedInLatest",
+                   "InternalId","InvalidLoginAttemptCount","MaxActiveSessions","MustUpdatePassword",
+                   "PasswordResetProviderId","PlayDefaultAudioTrack","RememberAudioSelections",
+                   "RememberSubtitleSelections","RowVersion","SubtitleMode","SyncPlayAccess",
+                   "Username","NormalizedUsername")
+                   VALUES (?1,'auth',0,0,0,0,1,1,1,
+                           (SELECT COALESCE(MAX("InternalId"),0)+1 FROM "Users"),
+                           0,0,0,'reset',1,1,1,0,0,0,?2,?3)"#,
+            )
+            .bind(id)
+            .bind(name)
+            .bind(ferrofin_util::string_extensions::upper_invariant(name))
+            .execute(db.writer())
+            .await
+            .expect("insert user with NormalizedUsername");
+        }
+
+        drop(db);
+        Database::connect_sized(&url, Some(2))
+            .await
+            .expect("re-open after adoption");
+    }
+
+    #[rstest::rstest]
+    #[case(1)]
+    #[case(2)]
+    #[tokio::test]
+    async fn refuses_partial_normalized_username_history(#[case] additions: usize) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jellyfin.db");
+        let mut ids = JELLYFIN_10_11_8_MIGRATIONS.to_vec();
+        ids.extend(&JELLYFIN_10_11_X_ADDITIVE_MIGRATIONS[..additions]);
+        seed_jellyfin_fixture(&path, &ids).await;
+        let err = Database::connect_sized(&format!("sqlite://{}", path.display()), Some(1))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::DbError::UnsupportedJellyfinDatabase { .. }
+        ));
+        assert!(!path.with_extension("db.pre-ferrofin").exists());
+    }
+
+    #[rstest::rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn upgrading_version_29_preserves_users_and_checks_collisions(#[case] collision: bool) {
+        use sqlx::{ConnectOptions, Connection};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ferrofin.db");
+        let mut conn = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .foreign_keys(false)
+            .connect()
+            .await
+            .unwrap();
+        let old = sqlx::migrate::Migrator {
+            migrations: std::borrow::Cow::Owned(
+                MIGRATOR
+                    .iter()
+                    .filter(|m| m.version <= 29)
+                    .cloned()
+                    .collect(),
+            ),
+            ..sqlx::migrate::Migrator::DEFAULT
+        };
+        old.run(&mut conn).await.unwrap();
+        for (id, name) in [
+            ("a", "münchen"),
+            ("b", if collision { "MÜNCHEN" } else { "ı" }),
+        ] {
+            sqlx::query(r#"INSERT INTO "Users"
+                ("Id","AuthenticationProviderId","DisplayCollectionsView","DisplayMissingEpisodes",
+                 "EnableAutoLogin","EnableLocalPassword","EnableNextEpisodeAutoPlay",
+                 "EnableUserPreferenceAccess","HidePlayedInLatest","InternalId",
+                 "InvalidLoginAttemptCount","MaxActiveSessions","MustUpdatePassword",
+                 "PasswordResetProviderId","PlayDefaultAudioTrack","RememberAudioSelections",
+                 "RememberSubtitleSelections","RowVersion","SubtitleMode","SyncPlayAccess","Username","Password")
+                VALUES (?1,'auth',0,0,0,0,1,1,1,1,0,0,0,'reset',1,1,1,0,0,0,?2,'original-hash')"#)
+                .bind(id).bind(name).execute(&mut conn).await.unwrap();
+        }
+        sqlx::query(r#"INSERT INTO "Permissions" ("Kind", "RowVersion", "UserId", "Value") VALUES (0, 1, 'a', 1)"#)
+            .execute(&mut conn).await.unwrap();
+        let previous_checksums: Vec<(i64, Vec<u8>)> =
+            sqlx::query_as("SELECT version, checksum FROM _sqlx_migrations ORDER BY version")
+                .fetch_all(&mut conn)
+                .await
+                .unwrap();
+        conn.close().await.unwrap();
+        let url = format!("sqlite://{}", path.display());
+        let opened = Database::connect_sized(&url, Some(1)).await;
+        if collision {
+            assert!(matches!(
+                opened,
+                Err(crate::DbError::UsernameCollision { .. })
+            ));
+            let mut conn = SqliteConnectOptions::new()
+                .filename(&path)
+                .connect()
+                .await
+                .unwrap();
+            let applied: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+            assert_eq!(applied, 29, "collision refused before SQL migrations");
+            let column: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM pragma_table_info('Users') WHERE name = 'NormalizedUsername'",
+            )
+            .fetch_optional(&mut conn)
+            .await
+            .unwrap();
+            assert!(column.is_none());
+            return;
+        }
+        let db = opened.unwrap();
+        let checksums: Vec<(i64, Vec<u8>)> = sqlx::query_as(
+            "SELECT version, checksum FROM _sqlx_migrations WHERE version <= 29 ORDER BY version",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(checksums, previous_checksums);
+        let rows: Vec<(String, String, String)> =
+            sqlx::query_as("SELECT Id, NormalizedUsername, Password FROM Users ORDER BY Id")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            [
+                ("a".into(), "MÜNCHEN".into(), "original-hash".into()),
+                ("b".into(), "ı".into(), "original-hash".into())
+            ]
+        );
+        let permissions: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM Permissions WHERE UserId = 'a' AND Value = 1")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(permissions, 1);
+        let applied: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 30 AND success",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(applied, 1);
+        db.close().await;
+        let reopened = Database::connect_sized(&url, Some(1)).await.unwrap();
+        reopened.run_migrations().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn refuses_a_jellyfin_database_with_an_unknown_migration() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        let mut ids = JELLYFIN_10_11_8_MIGRATIONS.to_vec();
+        ids.push("20270101000000_SomethingFromTheFuture");
+        seed_jellyfin_fixture(&path, &ids).await;
+
+        let url = format!("sqlite://{}", path.display());
+        let err = Database::connect_sized(&url, Some(2))
+            .await
+            .expect_err("adoption must refuse an unknown migration");
+        assert!(
+            matches!(err, crate::DbError::UnsupportedJellyfinDatabase { .. }),
+            "unexpected error: {err}"
+        );
+        assert!(err.to_string().contains("SomethingFromTheFuture"));
+        assert!(!path.with_extension("db.pre-ferrofin").exists());
     }
 
     #[tokio::test]

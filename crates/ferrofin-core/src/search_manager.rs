@@ -239,8 +239,8 @@ fn score(name: &str, term: &str) -> Option<f32> {
     if term.is_empty() {
         return Some(SCORE_SUBSTRING);
     }
-    let name_lc = name.to_lowercase();
-    let term_lc = term.to_lowercase();
+    let name_lc = ferrofin_util::string_extensions::lower_invariant(name);
+    let term_lc = ferrofin_util::string_extensions::lower_invariant(term);
     if name_lc == term_lc {
         Some(SCORE_EXACT)
     } else if name_lc.starts_with(&term_lc) {
@@ -533,6 +533,14 @@ mod tests {
             Arc::new(FerrofinItemRepository::new(db.clone(), lookup)),
             Arc::new(crate::user_manager::FerrofinUserManager::new(db.clone())),
         )
+    }
+
+    #[rstest::rstest]
+    #[case("ΟΣ", "οσ")]
+    #[case("Élodie", "élodie")]
+    #[case("𐐀", "𐐨")]
+    fn unicode_search_score(#[case] name: &str, #[case] term: &str) {
+        assert_eq!(score(name, term), Some(SCORE_EXACT));
     }
 
     #[test]

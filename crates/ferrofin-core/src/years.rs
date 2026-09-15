@@ -119,6 +119,18 @@ impl YearStore {
             if self.persistence.item_exists(id).await? {
                 continue;
             }
+            // A custom Unicode metadata root may have produced a different ID
+            // under the old full-lowercase mapping. Retain that existing row.
+            let previous = item_type_lookup::previous_by_name_item_id(
+                &self.id_derivation,
+                BaseItemKind::Year,
+                &self.path_of(&year.to_string()),
+            );
+            if let Some(previous) = previous.filter(|previous| *previous != id)
+                && self.persistence.item_exists(previous).await?
+            {
+                continue;
+            }
             let entity = self.entity(id, year);
             if let Some(path) = entity.path.as_deref() {
                 tokio::fs::create_dir_all(path)
@@ -153,6 +165,43 @@ mod tests {
         };
         let s = YearStore::new(persistence, mode, tmp.path().join("metadata/Year"));
         (db, s)
+    }
+
+    #[tokio::test]
+    async fn unicode_metadata_root_preserves_existing_year_id() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("ΟΣ/Year");
+        let mode = IdDerivation::Jellyfin {
+            program_data_path: Some(tmp.path().to_string_lossy().into_owned()),
+        };
+        let store = YearStore::new(
+            Arc::new(FerrofinItemPersistenceService::new(db.clone())),
+            mode.clone(),
+            &root,
+        );
+        let previous = item_type_lookup::previous_by_name_item_id(
+            &mode,
+            BaseItemKind::Year,
+            &store.path_of("2026"),
+        )
+        .unwrap();
+        assert_ne!(store.id_of(2026), Some(previous));
+        store
+            .persistence
+            .save_items(&[store.entity(previous, 2026)])
+            .await
+            .unwrap();
+        assert!(store.ensure_missing(&[2026]).await.unwrap().is_empty());
+        let rows = item_repository_over(db)
+            .get_item_list(&InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::Year],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, guid_to_db(previous));
     }
 
     #[tokio::test]

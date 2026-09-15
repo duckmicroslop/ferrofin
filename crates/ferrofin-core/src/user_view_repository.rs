@@ -439,10 +439,7 @@ async fn move_ancestors(
     .filter_map(|id| Uuid::parse_str(id).ok())
     .collect();
     for item in items {
-        if Uuid::parse_str(&item)
-            .ok()
-            .is_some_and(|id| existing.contains(&id))
-        {
+        if Uuid::parse_str(&item).is_ok_and(|id| existing.contains(&id)) {
             continue;
         }
         sqlx::query(

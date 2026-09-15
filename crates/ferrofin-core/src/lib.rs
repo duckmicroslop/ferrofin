@@ -208,6 +208,7 @@ pub mod quick_connect_manager;
 pub mod resolvers;
 pub mod scheduled_tasks;
 pub mod search_manager;
+pub mod server_discovery;
 pub mod session_bus;
 pub mod session_manager;
 pub mod session_websocket_listener;
@@ -228,6 +229,7 @@ pub mod user_root_folder;
 pub mod user_view_manager;
 pub mod user_view_repository;
 pub mod virtual_folder_manager;
+pub mod virtual_paths;
 pub mod years;
 
 #[cfg(test)]
@@ -282,6 +284,7 @@ pub use plugin_manager::{
 pub use quick_connect_manager::FerrofinQuickConnect;
 pub use scheduled_tasks::{FerrofinTaskManager, RefreshLibraryTask, ScheduledTask, TaskProgress};
 pub use search_manager::FerrofinSearchManager;
+pub use server_discovery::{ServerDiscovery, ServerDiscoveryError};
 pub use session_bus::FerrofinSessionMessageBus;
 pub use session_manager::FerrofinSessionManager;
 pub use session_websocket_listener::{FerrofinSessionWebSocketListener, FerrofinWebSocketManager};

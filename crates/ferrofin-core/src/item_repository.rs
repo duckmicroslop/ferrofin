@@ -11,6 +11,8 @@
 //! not taken as a field (it would be injected at the composition root if a later
 //! method needs it).
 
+use ferrofin_util::string_extensions::{lower_invariant, upper_invariant};
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -44,6 +46,7 @@ use crate::translate_query::{
     to_guid_strings,
 };
 use crate::user_entity_ext::{guid_preference, has_permission, live_tv_enabled_for};
+use crate::virtual_paths::VirtualPathExpander;
 use sqlx::{FromRow, QueryBuilder, Row, Sqlite};
 
 /// The concrete item repository.
@@ -57,6 +60,10 @@ pub struct FerrofinItemRepository {
     /// The `UserRootFolder`/`AggregateFolder` ids, injected once by the
     /// composition root (see [`FerrofinItemRepository::with_root_ids`]).
     roots: Option<RootFolderIds>,
+    /// Expands the `%MetadataPath%`/`%AppDataPath%` tokens an adopted Jellyfin
+    /// database stores in image paths (see
+    /// [`FerrofinItemRepository::with_virtual_paths`]).
+    virtual_paths: VirtualPathExpander,
 }
 
 impl std::fmt::Debug for FerrofinItemRepository {
@@ -95,6 +102,7 @@ impl FerrofinItemRepository {
         Self {
             db,
             item_type_lookup,
+            virtual_paths: VirtualPathExpander::identity(),
             roots: None,
         }
     }
@@ -109,6 +117,16 @@ impl FerrofinItemRepository {
     #[must_use]
     pub fn with_root_ids(mut self, roots: RootFolderIds) -> Self {
         self.roots = Some(roots);
+        self
+    }
+
+    /// Installs the server's [`VirtualPathExpander`], so image rows adopted
+    /// from Jellyfin (`%MetadataPath%/library/…`) come back as real paths —
+    /// the read half of `BaseItemRepository.Map`. Called once by the
+    /// composition root; without it stored tokens pass through verbatim.
+    #[must_use]
+    pub fn with_virtual_paths(mut self, virtual_paths: VirtualPathExpander) -> Self {
+        self.virtual_paths = virtual_paths;
         self
     }
 
@@ -1591,10 +1609,10 @@ fn append_by_name_filters<'a>(
     let non_blank = |v: &'a Option<String>| v.as_deref().map(str::trim).filter(|s| !s.is_empty());
     append_predicates(qb, outer);
     if let Some(term) = non_blank(&filter.search_term) {
-        let lowered = term.to_lowercase();
+        let lowered = lower_invariant(term);
         if lowered.contains(SEARCH_WILDCARD_TERMS) {
             let like = format!("%{}%", lowered.trim_matches('%'));
-            qb.push(r#" AND lower(bi."CleanName") LIKE "#)
+            qb.push(r#" AND ferrofin_lower_invariant(bi."CleanName") LIKE "#)
                 .push_bind(like);
         } else {
             let like = format!(
@@ -1605,8 +1623,8 @@ fn append_by_name_filters<'a>(
         }
     }
     if let Some(prefix) = non_blank(&filter.name_starts_with) {
-        qb.push(r#" AND lower(COALESCE(bi."SortName", bi."Name")) LIKE "#)
-            .push_bind(format!("{}%", prefix.to_lowercase()));
+        qb.push(r#" AND ferrofin_upper_invariant(COALESCE(bi."SortName", bi."Name")) LIKE "#)
+            .push_bind(format!("{}%", upper_invariant(prefix)));
     }
     // Both bounds are FULL-STRING comparisons against the lowercased parameter,
     // over `SortName` only (C# `BaseItemRepository.cs:2036-2046`:
@@ -1615,12 +1633,12 @@ fn append_by_name_filters<'a>(
     // `nameStartsWithOrGreater=j` return the wrong page — and `>` instead of
     // `>=` dropped the boundary row itself.
     if let Some(boundary) = non_blank(&filter.name_starts_with_or_greater) {
-        qb.push(r#" AND bi."SortName" >= "#)
-            .push_bind(boundary.to_lowercase());
+        qb.push(r#" AND ferrofin_lower_invariant(bi."SortName") >= "#)
+            .push_bind(lower_invariant(boundary));
     }
     if let Some(boundary) = non_blank(&filter.name_less_than) {
-        qb.push(r#" AND bi."SortName" < "#)
-            .push_bind(boundary.to_lowercase());
+        qb.push(r#" AND ferrofin_lower_invariant(bi."SortName") < "#)
+            .push_bind(lower_invariant(boundary));
     }
 }
 
@@ -1714,13 +1732,16 @@ pub(crate) fn image_type_to_disc(image_type: ImageType) -> i32 {
 /// The stored `Blurhash` is a UTF-8 byte blob; an empty blob (or one that is not
 /// valid UTF-8) becomes [`None`]. A zero/negative width or height (the "unknown"
 /// sentinel) is preserved as-is; the API layer nulls those out per Jellyfin.
-fn image_info_from_row(row: BaseItemImageInfoEntity) -> ItemImageInfo {
+fn image_info_from_row(
+    row: BaseItemImageInfoEntity,
+    virtual_paths: &VirtualPathExpander,
+) -> ItemImageInfo {
     let blur_hash = row
         .blurhash
         .filter(|b| !b.is_empty())
         .and_then(|b| String::from_utf8(b).ok());
     ItemImageInfo {
-        path: row.path,
+        path: virtual_paths.expand(&row.path),
         image_type: image_type_from_disc(row.image_type),
         date_modified: row.date_modified.unwrap_or_else(default_epoch),
         width: i32::try_from(row.width).unwrap_or(0),
@@ -2234,7 +2255,10 @@ impl ItemRepository for FerrofinItemRepository {
         .fetch_all(self.db.pool())
         .await
         .map_err(db_err)?;
-        Ok(rows.into_iter().map(image_info_from_row).collect())
+        Ok(rows
+            .into_iter()
+            .map(|row| image_info_from_row(row, &self.virtual_paths))
+            .collect())
     }
 
     async fn swap_item_images(
@@ -2673,6 +2697,65 @@ mod tests {
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_model::entities::ExtraType;
     use ferrofin_traits::persistence::ItemPersistenceService;
+
+    #[rstest::rstest]
+    #[case("Élodie", "él", true)]
+    #[case("ΟΣ", "οσ", true)]
+    #[case("𐐀 Star", "𐐨", true)]
+    #[case("ı", "I", false)]
+    #[case("ß", "ss", false)]
+    #[tokio::test]
+    async fn unicode_name_prefix(
+        #[case] stored: &str,
+        #[case] prefix: &str,
+        #[case] matches: bool,
+    ) {
+        let db = test_db().await;
+        let id = Uuid::new_v4();
+        seed_named_item(&db, id, BaseItemKind::Person, stored).await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "SortName" = ?1 WHERE "Id" = ?2"#)
+            .bind(stored)
+            .bind(guid_to_db(id))
+            .execute(db.writer())
+            .await
+            .unwrap();
+        let result = repo(&db)
+            .get_item_list(&InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::Person],
+                name_starts_with: Some(prefix.to_owned()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.iter().any(|row| row.id == guid_to_db(id)), matches);
+    }
+
+    #[rstest::rstest]
+    #[case("Élodie", "élodie")]
+    #[case("ΟΣ", "οσ")]
+    #[case("𐐀 Star", "𐐨 star")]
+    #[tokio::test]
+    async fn unicode_original_title_search(#[case] stored: &str, #[case] term: &str) {
+        let db = test_db().await;
+        let id = Uuid::new_v4();
+        seed_named_item(&db, id, BaseItemKind::Movie, "Unrelated title").await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "OriginalTitle" = ?1 WHERE "Id" = ?2"#)
+            .bind(stored)
+            .bind(guid_to_db(id))
+            .execute(db.writer())
+            .await
+            .unwrap();
+        let result = repo(&db)
+            .get_item_list(&InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::Movie],
+                search_term: Some(term.to_owned()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, guid_to_db(id));
+    }
 
     fn repo(db: &Database) -> FerrofinItemRepository {
         FerrofinItemRepository::new(db.clone(), Arc::new(ItemTypeLookup::new()))
@@ -3331,7 +3414,7 @@ mod tests {
             // two forms are compared on a non-trivial row order.
             sqlx::query(r#"UPDATE "BaseItems" SET "SortName" = ?2 WHERE "Id" = ?1"#)
                 .bind(guid_to_db(Uuid::from_u128(n)))
-                .bind(name.to_lowercase())
+                .bind(lower_invariant(name))
                 .execute(db.writer())
                 .await
                 .expect("sort name");
@@ -3663,6 +3746,44 @@ mod tests {
         assert_eq!(
             repository.get_item_list(&both).await.expect("both").len(),
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn get_image_infos_expands_jellyfin_virtual_paths() {
+        let db = test_db().await;
+        let item = Uuid::from_u128(0x9003);
+        seed_named_item(&db, item, BaseItemKind::Series, "Adopted").await;
+        // What an adopted Jellyfin row holds: the metadata dir as a token.
+        sqlx::query(
+            r#"INSERT INTO "BaseItemImageInfos"
+                ("Id", "Blurhash", "DateModified", "Height", "ImageType", "ItemId", "Path", "Width")
+                VALUES (?1, NULL, NULL, 0, 4, ?2, '%MetadataPath%/library/9c/9c3f/thumb.jpg', 0)"#,
+        )
+        .bind(guid_to_db(Uuid::from_u128(0x9103)))
+        .bind(guid_to_db(item))
+        .execute(db.writer())
+        .await
+        .expect("insert thumb");
+
+        // Without an expander the token passes through verbatim.
+        let raw = repo(&db).get_image_infos(item).await.expect("images");
+        assert_eq!(raw[0].path, "%MetadataPath%/library/9c/9c3f/thumb.jpg");
+
+        // With the server's paths it is the file the copied metadata/ holds.
+        let root = tempfile::tempdir().expect("tempdir");
+        let paths = crate::app_paths::test_paths(root.path());
+        let repository =
+            repo(&db).with_virtual_paths(VirtualPathExpander::from_paths(Arc::clone(&paths)));
+        let images = repository.get_image_infos(item).await.expect("images");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].image_type, ImageType::Logo);
+        assert_eq!(
+            images[0].path,
+            format!(
+                "{}/library/9c/9c3f/thumb.jpg",
+                ferrofin_traits::system::ServerApplicationPaths::internal_metadata_path(&*paths)
+            )
         );
     }
 

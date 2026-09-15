@@ -17,8 +17,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - Pin id-list queries to the primary key: 12.0 drops
   `IX_BaseItems_Id_Type_IsFolder_IsVirtualItem`, and without the `+"Type"` pin the
   planner scanned every row of the type (`detail:similar` 4.9 → 7.8 ms p50)
-- Adopt Jellyfin 12.0 databases in place alongside 10.11.8 (exact migration sets; an
-  atomic adoption record drives the one-shot membership import)
+- Adopt Jellyfin 12.0 databases in place alongside 10.11.8–10.11.11 (exact migration sets
+  per generation; `0030` is baselined where the database already owns `NormalizedUsername`;
+  an atomic adoption record drives the one-shot membership import)
 - Run `PRAGMA foreign_key_check` on every boot, not only after a migration
 
 ### Parity

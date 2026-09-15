@@ -119,6 +119,13 @@ async fn fresh_ferrofin_schema_equals_real_jellyfin_12_0() {
         .await
         .expect("apply fixture schema");
 
+    // No code backfill: the SQL migration chain alone must own the full schema.
+    let sql_only = Database::connect_in_memory().await.expect("SQL connect");
+    sqlx::migrate!("./migrations")
+        .run(sql_only.pool())
+        .await
+        .expect("SQL chain");
+
     // A fresh Ferrofin database through the full migration chain.
     let ferrofin = Database::connect_in_memory()
         .await
@@ -127,6 +134,11 @@ async fn fresh_ferrofin_schema_equals_real_jellyfin_12_0() {
 
     let (jf_tables, jf_indexes) = snapshot(jellyfin.pool()).await;
     let (hm_tables, hm_indexes) = snapshot(ferrofin.pool()).await;
+    assert_eq!(
+        snapshot(sql_only.pool()).await,
+        snapshot(ferrofin.pool()).await,
+        "Rust backfill must not alter the schema produced by SQL migrations"
+    );
 
     let jf_names: BTreeSet<_> = jf_tables.keys().collect();
     let hm_names: BTreeSet<_> = hm_tables.keys().collect();

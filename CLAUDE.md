@@ -37,7 +37,7 @@ Consequences you must respect:
 
 ## Workspace layout
 
-Rust workspace, edition 2024, toolchain pinned to **1.97.1** (stable). Library crates in
+Rust workspace, edition 2024, toolchain pinned to **1.98.1** (stable). Library crates in
 `crates/`, the server binary in `apps/`.
 
 ```
@@ -64,7 +64,7 @@ chromaprint      health       │          ├─ drawing
 | `ferrofin-networking` | bind / published-URL resolution |
 | `ferrofin-health` | liveness/readiness router |
 | `ferrofin-metrics` | Prometheus `/metrics` with Jellyfin-parity names (see `docs/conventions/METRICS.md`) |
-| `ferrofin-db` | **sqlx + SQLite** — entity `FromRow` structs, the migration chain, `Database` handle (schema pinned byte-equal to Jellyfin 12.0; adopts 10.11.8 and 12.0 databases in place) |
+| `ferrofin-db` | **sqlx + SQLite** — entity `FromRow` structs, the migration chain, `Database` handle (schema pinned byte-equal to Jellyfin 12.0; adopts 10.11.8–10.11.11 and 12.0 databases in place) |
 | `ferrofin-traits` | the manager/service **traits** — the dependency-injection seam (see below) |
 | `ferrofin-mediaencoding` | ffmpeg/ffprobe: probing, transcode arg-building, the live transcode runtime |
 | `ferrofin-hls` | HLS playlist generation + the stream manager |

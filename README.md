@@ -109,6 +109,9 @@ docker run -d --name ferrofin \
   ghcr.io/mangoleaf/ferrofin:latest
 ```
 
+For automatic LAN server discovery, see [server discovery deployment](docs/SERVER_DISCOVERY.md).
+The TCP mapping above supports manual URL connections; it does not forward discovery broadcasts.
+
 **Helm** (the chart is published as an OCI artifact next to the image):
 
 ```sh
@@ -117,6 +120,11 @@ helm install ferrofin oci://ghcr.io/mangoleaf/ferrofin/charts/ferrofin -n ferrof
 
 See [`charts/ferrofin/README.md`](charts/ferrofin/README.md) and
 [`values.example.yaml`](charts/ferrofin/values.example.yaml) for a worked configuration.
+
+**Debian/Ubuntu package** (depends on `jellyfin-ffmpeg8` and `jellyfin-web` from Jellyfin's
+apt repository, ships a hardened systemd unit): add the repository, then
+`apt-get install ./ferrofin_<version>_<arch>.deb` from the releases page. The full walk-through,
+including the plain release tarball, is [`docs/INSTALL.md`](docs/INSTALL.md).
 
 **From source** (needs the pinned Rust toolchain; ffmpeg is optional and its absence only
 disables transcoding):
@@ -140,10 +148,15 @@ Configuration is via CLI flags, `FERROFIN_*` environment variables, or
 ## Migrating from Jellyfin
 
 Ferrofin reads Jellyfin's database directly. Point it at a data directory containing a
-Jellyfin **10.11.8** or **12.0** `jellyfin.db` and on first boot it detects the database, validates its
-migration set (and refuses loudly rather than half-adopting an unexpected version), and
+Jellyfin **10.11.8–10.11.11** or **12.0** `jellyfin.db` and on first boot it detects the database,
+validates its migration set (and refuses loudly rather than half-adopting an unexpected version), and
 adopts it in place: **no re-scan, no re-import**. Users, watch state, playlists, and Live TV
-configuration carry forward.
+configuration carry forward. Ferrofin retains the `Users.NormalizedUsername` column and
+unique index from Jellyfin 10.11.10/10.11.11 and adds them to older databases. Login,
+creation, and renaming use Unicode-aware invariant uppercase keys compatible with
+Jellyfin, while the original spelling remains visible. If existing usernames collide
+under these rules, startup stops with the conflicting account IDs and names; resolve
+the names in the original server before retrying. Accounts are never merged.
 
 > ### ⚠ Migration is one-way. Back up first.
 >
@@ -153,10 +166,23 @@ configuration carry forward.
 > `jellyfin.db.pre-ferrofin` before it touches anything and logs the path, but do not rely
 > on that alone:
 >
-> 1. Stop Jellyfin.
-> 2. **Copy the whole Jellyfin data directory somewhere safe** (the database, its `-wal`
->    and `-shm` files if present, and the metadata/config folders).
-> 3. Start Ferrofin against a copy, not the original, until you are satisfied.
+> 1. Stop both Jellyfin and Ferrofin.
+> 2. **Back up the whole Jellyfin data directory and all configuration files**, including
+>    hidden files and database `-wal`/`-shm` companions if present. Configuration may live
+>    separately, for example in `/etc/jellyfin` on Debian. Include any external state
+>    directories too.
+> 3. Copy the complete data and configuration into a clean Ferrofin destination **before
+>    its first startup**. Keep the originals and backup intact. An existing `ferrofin.db`
+>    or Ferrofin JSON configuration takes precedence over copied Jellyfin files.
+>
+> The complete copy preserves library definitions under `root/default/`, images under
+> `metadata/`, and server configuration. In particular, omitting `network.xml` can discard
+> remote-access restrictions and IP filters. Ferrofin imports supported XML settings into
+> JSON; verify the imported settings and investigate import warnings before exposing the
+> server. Jellyfin .NET plugins need Ferrofin-compatible replacements.
+>
+> Follow the [migration procedure](docs/INSTALL.md#migrate-an-existing-jellyfin-installation)
+> for copying, startup verification, and rollback.
 >
 > If you decide to go back to Jellyfin, restore that backup. Anything that happened in
 > Ferrofin after the switch (watch state, new users, playlists) stays in Ferrofin.

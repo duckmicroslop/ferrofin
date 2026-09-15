@@ -293,10 +293,28 @@ pub fn person_item_id(mode: &IdDerivation, people_path: &str, name: &str) -> Opt
 /// a scanned item's id the key is lowercased *after* the data-dir rewrite
 /// (verified against a 10.11.8 database: `Year` `2026` at
 /// `/config/metadata/Year/2026` hashes `metadata\year\2026`, not
-/// `metadata\Year\2026`). Under [`IdDerivation::LegacyLowercase`] the key is
-/// already lowercase, so both modes agree on the normalization.
+/// `metadata\Year\2026`). [`IdDerivation::LegacyLowercase`] retains Rust's
+/// original full lowercase mapping so existing legacy identities stay stable.
 #[must_use]
 pub fn by_name_item_id(mode: &IdDerivation, kind: BaseItemKind, path: &str) -> Option<uuid::Uuid> {
+    by_name_item_id_with_casing(mode, kind, path, false)
+}
+
+/// Previous Rust-full-lowercase identity, used only to retain existing rows.
+pub(crate) fn previous_by_name_item_id(
+    mode: &IdDerivation,
+    kind: BaseItemKind,
+    path: &str,
+) -> Option<uuid::Uuid> {
+    by_name_item_id_with_casing(mode, kind, path, true)
+}
+
+fn by_name_item_id_with_casing(
+    mode: &IdDerivation,
+    kind: BaseItemKind,
+    path: &str,
+    previous: bool,
+) -> Option<uuid::Uuid> {
     let type_name = stored_type_name(kind)?;
     let key = match mode {
         IdDerivation::Jellyfin { program_data_path } => {
@@ -304,7 +322,12 @@ pub fn by_name_item_id(mode: &IdDerivation, kind: BaseItemKind, path: &str) -> O
                 .as_deref()
                 .and_then(|data| path.strip_prefix(data))
                 .map(|rel| rel.trim_start_matches(['/', '\\']).replace('/', "\\"));
-            rewritten.unwrap_or_else(|| path.to_owned()).to_lowercase()
+            let key = rewritten.unwrap_or_else(|| path.to_owned());
+            if previous {
+                key.to_lowercase()
+            } else {
+                ferrofin_util::string_extensions::lower_invariant(&key)
+            }
         }
         IdDerivation::LegacyLowercase => path.to_lowercase(),
     };
@@ -431,6 +454,29 @@ impl ItemTypeLookupTrait for ItemTypeLookup {
 
 #[cfg(test)]
 mod tests {
+    #[rstest::rstest]
+    #[case("İpek", "İpek")]
+    #[case("ΟΣ", "οσ")]
+    #[case("𐐀", "𐐨")]
+    fn unicode_by_name_identity(#[case] name: &str, #[case] lowered: &str) {
+        let mode = IdDerivation::Jellyfin {
+            program_data_path: Some("/data".to_owned()),
+        };
+        let path = format!("/data/metadata/Genre/{name}");
+        let expected = ferrofin_common::extensions::get_md5(&format!(
+            "MediaBrowser.Controller.Entities.Genremetadata\\genre\\{lowered}"
+        ));
+        assert_eq!(
+            super::by_name_item_id(&mode, BaseItemKind::Genre, &path),
+            Some(expected)
+        );
+        let legacy = IdDerivation::LegacyLowercase;
+        assert_eq!(
+            super::by_name_item_id(&legacy, BaseItemKind::Genre, &path),
+            super::previous_by_name_item_id(&legacy, BaseItemKind::Genre, &path)
+        );
+    }
+
     #[test]
     fn person_path_matches_person_get_path() {
         use super::person_path;

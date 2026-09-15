@@ -1,139 +1,305 @@
-//! The `Users.NormalizedUsername` lookup key (Jellyfin 12.0) and the boot-time
-//! repair that rewrites keys the schema migration folded ASCII-only.
-//!
-//! 12.0 stores `Username.ToUpperInvariant()` in the column and matches every
-//! by-name lookup on it exactly (`User.cs:28-29`, `UserManager.cs:163/185/348`).
-//! The migration that added the column filled it with SQL `upper()`, which
-//! only folds ASCII: a user named `münchen` was stored as `MüNCHEN`, and every
-//! lookup — login included — compares against `MÜNCHEN` and misses. This is
-//! the ONE spelling of the key ([`normalized_username`]); the manager's writes
-//! and the repair both go through it, so a repaired row and a freshly written
-//! one cannot disagree.
+//! Unicode username data backfill. Migration 0030 owns the schema; this module
+//! only validates and updates values before requests can reach the database.
 
-use crate::{Database, Result};
+use crate::{DbError, Result};
+use ferrofin_util::string_extensions::upper_invariant;
+use sqlx::{Connection, SqliteConnection};
 
-/// The `FerrofinMeta` key recording that [`repair_normalized_usernames`] ran.
-pub const META_KEY: &str = "normalized_usernames_v12";
+const MARKER: &str = "normalized_usernames_icu_v1";
 
-/// The stored lookup key for a username: .NET `ToUpperInvariant` (the simple
-/// one-to-one uppercase mapping — `ß` stays `ß`).
-#[must_use]
-pub fn normalized_username(username: &str) -> String {
-    ferrofin_util::string_extensions::upper_invariant(username)
+fn validate_users(users: &[(String, String)]) -> Result<()> {
+    let mut keys = std::collections::HashMap::new();
+    for (id, name) in users {
+        if let Some(first) = keys.insert(upper_invariant(name), (id.clone(), name.clone())) {
+            return Err(DbError::UsernameCollision {
+                first,
+                second: (id.clone(), name.clone()),
+            });
+        }
+    }
+    Ok(())
 }
 
-/// One-shot startup pass: rewrites every `NormalizedUsername` that is not
-/// [`normalized_username`] of its `Username`, recording completion under
-/// [`META_KEY`] so later boots skip it. Returns how many rows were rewritten.
-///
-/// Rows that already agree (every ASCII name, and every row Jellyfin 12.0 or
-/// a current Ferrofin wrote) are left untouched. The marker is written inside
-/// the rewrite transaction, so a failure simply retries on the next boot.
+/// Reject conflicting identities before applying SQL migrations to an existing
+/// database. A fresh database has no Users table and needs no preflight.
 ///
 /// # Errors
-/// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if a query or the
-/// transaction fails.
-pub async fn repair_normalized_usernames(db: &Database) -> Result<u64> {
-    if db.meta_get(META_KEY).await?.as_deref() == Some("1") {
-        return Ok(0);
-    }
-
-    let rows: Vec<(String, String, String)> =
-        sqlx::query_as(r#"SELECT "Id", "Username", "NormalizedUsername" FROM "Users""#)
-            .fetch_all(db.pool())
+/// Returns a collision error naming both accounts, or a database read error.
+pub async fn preflight(conn: &mut SqliteConnection) -> Result<()> {
+    let exists: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'Users'")
+            .fetch_optional(&mut *conn)
             .await?;
+    if exists.is_none() {
+        return Ok(());
+    }
+    let users = sqlx::query_as(r#"SELECT "Id", "Username" FROM "Users" ORDER BY "Id""#)
+        .fetch_all(&mut *conn)
+        .await?;
+    validate_users(&users)
+}
 
-    let mut tx = db.writer().begin().await?;
-    let mut repaired: u64 = 0;
-    for (id, username, stored) in rows {
-        let want = normalized_username(&username);
-        if want == stored {
-            continue;
+/// Repairs normalized values in the schema established by migration 0030.
+/// Data and completion marker change atomically; no schema objects are changed.
+///
+/// # Errors
+/// Returns a collision error without rewriting values when two accounts have
+/// the same final key, or a database error. Callers must stop startup on error.
+pub async fn repair(conn: &mut SqliteConnection) -> Result<()> {
+    let mut tx = conn.begin().await?;
+    let done: Option<String> =
+        sqlx::query_scalar(r#"SELECT "Value" FROM "FerrofinMeta" WHERE "Key" = ?1"#)
+            .bind(MARKER)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if done.as_deref() == Some("1") {
+        return Ok(());
+    }
+    let users: Vec<(String, String, String)> = sqlx::query_as(
+        r#"SELECT "Id", "Username", "NormalizedUsername" FROM "Users" ORDER BY "Id""#,
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    validate_users(
+        &users
+            .iter()
+            .map(|(id, name, _)| (id.clone(), name.clone()))
+            .collect::<Vec<_>>(),
+    )?;
+
+    let mut occupied = std::collections::HashSet::new();
+    let mut changes = Vec::new();
+    for (id, name, stored) in users {
+        let desired = upper_invariant(&name);
+        occupied.insert(stored.clone());
+        occupied.insert(desired.clone());
+        if desired != stored {
+            changes.push((id, desired));
         }
+    }
+    // Stage changing rows under unused values so stale keys can be swapped
+    // without dropping the unique index. Temporary values are never committed.
+    let mut sequence = 0_u64;
+    for (id, _) in &changes {
+        let temporary = loop {
+            let candidate = format!("ferrofin-normalization-{sequence}");
+            sequence += 1;
+            if occupied.insert(candidate.clone()) {
+                break candidate;
+            }
+        };
         sqlx::query(r#"UPDATE "Users" SET "NormalizedUsername" = ?2 WHERE "Id" = ?1"#)
-            .bind(&id)
-            .bind(&want)
+            .bind(id)
+            .bind(temporary)
             .execute(&mut *tx)
             .await?;
-        repaired += 1;
     }
-    sqlx::query(
-        r#"INSERT INTO "FerrofinMeta" ("Key", "Value") VALUES (?1, '1')
-           ON CONFLICT("Key") DO UPDATE SET "Value" = excluded."Value""#,
-    )
-    .bind(META_KEY)
-    .execute(&mut *tx)
-    .await?;
+    for (id, desired) in &changes {
+        sqlx::query(r#"UPDATE "Users" SET "NormalizedUsername" = ?2 WHERE "Id" = ?1"#)
+            .bind(id)
+            .bind(desired)
+            .execute(&mut *tx)
+            .await?;
+    }
+    sqlx::query(r#"INSERT INTO "FerrofinMeta" ("Key", "Value") VALUES (?1, '1')"#)
+        .bind(MARKER)
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
-    Ok(repaired)
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{META_KEY, normalized_username, repair_normalized_usernames};
-    use crate::Database;
+    use super::*;
+    use rstest::rstest;
 
-    /// Inserts a `Users` row keyed the way migration 0032's `upper()` did.
-    async fn seed(db: &Database, id: &str, username: &str) {
-        sqlx::query(
-            r#"INSERT INTO "Users"
-               ("Id", "AuthenticationProviderId", "DisplayCollectionsView",
-                "DisplayMissingEpisodes", "EnableAutoLogin", "EnableLocalPassword",
-                "EnableNextEpisodeAutoPlay", "EnableUserPreferenceAccess",
-                "HidePlayedInLatest", "InternalId", "InvalidLoginAttemptCount",
-                "MaxActiveSessions", "MustUpdatePassword",
-                "PasswordResetProviderId", "PlayDefaultAudioTrack",
-                "RememberAudioSelections", "RememberSubtitleSelections",
-                "RowVersion", "SubtitleMode", "SyncPlayAccess", "Username", "NormalizedUsername")
-               VALUES (?1, '', 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, '', 1, 1, 1, 0, 0, 0, ?2, upper(?2))"#,
+    async fn fixture(has_column: bool) -> SqliteConnection {
+        let mut conn = SqliteConnection::connect("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql(
+            r#"
+            CREATE TABLE "FerrofinMeta" ("Key" TEXT PRIMARY KEY, "Value" TEXT NOT NULL);
+            CREATE TABLE "Users" ("Id" TEXT PRIMARY KEY, "Username" TEXT UNIQUE,
+                "Password" TEXT, "Permission" INTEGER);
+            INSERT INTO "Users" VALUES ('a', 'münchen', 'password-hash-a', 1),
+                ('b', 'ı', 'password-hash-b', 0);
+        "#,
         )
-        .bind(id)
-        .bind(username)
-        .execute(db.writer())
+        .execute(&mut conn)
         .await
-        .expect("seed user");
-    }
-
-    async fn stored(db: &Database, username: &str) -> String {
-        sqlx::query_scalar(r#"SELECT "NormalizedUsername" FROM "Users" WHERE "Username" = ?1"#)
-            .bind(username)
-            .fetch_one(db.pool())
+        .unwrap();
+        if has_column {
+            sqlx::raw_sql(
+                r#"
+                ALTER TABLE "Users" ADD COLUMN "NormalizedUsername" TEXT NOT NULL DEFAULT '';
+                UPDATE "Users" SET "NormalizedUsername" = upper("Username");
+                CREATE UNIQUE INDEX "IX_Users_NormalizedUsername" ON "Users" ("NormalizedUsername");
+            "#,
+            )
+            .execute(&mut conn)
             .await
-            .expect("stored key")
+            .unwrap();
+        } else {
+            sqlx::raw_sql(include_str!("../migrations/0030_normalized_usernames.sql"))
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+        conn
     }
 
-    #[test]
-    fn the_key_is_the_invariant_uppercase() {
-        assert_eq!(normalized_username("alice"), "ALICE");
-        assert_eq!(normalized_username("münchen"), "MÜNCHEN");
-        assert_eq!(normalized_username("straße"), "STRAßE");
-    }
-
-    /// Non-ASCII keys the migration folded wrong are rewritten, agreeing rows
-    /// are left alone, and the marker makes the pass a no-op afterwards.
     #[tokio::test]
-    async fn repair_rewrites_ascii_folded_keys_once() {
-        let db = Database::connect_in_memory().await.expect("connect");
-        db.run_migrations().await.expect("migrate");
-        seed(&db, "00000000-0000-0000-0000-000000000051", "münchen").await;
-        seed(&db, "00000000-0000-0000-0000-000000000052", "þór").await;
-        seed(&db, "00000000-0000-0000-0000-000000000053", "alice").await;
-        assert_eq!(
-            stored(&db, "münchen").await,
-            "MüNCHEN",
-            "the ASCII-only fold"
-        );
+    async fn backfill_swaps_stale_keys_without_dropping_the_unique_index() {
+        let mut conn = fixture(true).await;
+        sqlx::query("UPDATE Users SET NormalizedUsername = 'temporary' WHERE Id = 'a'")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE Users SET NormalizedUsername = 'MÜNCHEN' WHERE Id = 'b'")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE Users SET NormalizedUsername = 'ı' WHERE Id = 'a'")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let before: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT name, sql FROM sqlite_master ORDER BY name")
+                .fetch_all(&mut conn)
+                .await
+                .unwrap();
+        repair(&mut conn).await.unwrap();
+        let after: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT name, sql FROM sqlite_master ORDER BY name")
+                .fetch_all(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(before, after);
+        let keys: Vec<String> =
+            sqlx::query_scalar("SELECT NormalizedUsername FROM Users ORDER BY Id")
+                .fetch_all(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(keys, ["MÜNCHEN", "ı"]);
+    }
 
-        assert_eq!(repair_normalized_usernames(&db).await.expect("repair"), 2);
-        assert_eq!(stored(&db, "münchen").await, "MÜNCHEN");
-        assert_eq!(stored(&db, "þór").await, "ÞÓR");
-        assert_eq!(stored(&db, "alice").await, "ALICE");
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn backfill_preserves_accounts_and_enforces_unicode_uniqueness(#[case] has_column: bool) {
+        let mut conn = fixture(has_column).await;
+        repair(&mut conn).await.unwrap();
+        let rows: Vec<(String, String, String, String, i64)> = sqlx::query_as(
+            r#"SELECT "Id", "Username", "NormalizedUsername", "Password", "Permission" FROM "Users" ORDER BY "Id""#
+        ).fetch_all(&mut conn).await.unwrap();
         assert_eq!(
-            db.meta_get(META_KEY).await.expect("meta").as_deref(),
-            Some("1")
+            rows,
+            vec![
+                (
+                    "a".into(),
+                    "münchen".into(),
+                    "MÜNCHEN".into(),
+                    "password-hash-a".into(),
+                    1
+                ),
+                (
+                    "b".into(),
+                    "ı".into(),
+                    "ı".into(),
+                    "password-hash-b".into(),
+                    0
+                ),
+            ]
         );
+        let duplicate = sqlx::query(r#"INSERT INTO "Users" ("Id", "Username", "NormalizedUsername") VALUES ('c', 'MÜNCHEN', 'MÜNCHEN')"#)
+            .execute(&mut conn).await.unwrap_err();
+        assert!(duplicate.as_database_error().unwrap().is_unique_violation());
+        repair(&mut conn).await.unwrap();
+        let markers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM FerrofinMeta")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(markers, 1);
+    }
 
-        // Second boot: nothing to do, even if a row were wrong again.
-        assert_eq!(repair_normalized_usernames(&db).await.expect("again"), 0);
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn failed_backfill_rolls_back_values_and_completion(#[case] has_column: bool) {
+        let mut conn = fixture(has_column).await;
+        sqlx::query("CREATE TRIGGER fail_backfill BEFORE UPDATE ON Users BEGIN SELECT RAISE(ABORT, 'injected failure'); END")
+            .execute(&mut conn).await.unwrap();
+        let before: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT name, sql FROM sqlite_master ORDER BY name")
+                .fetch_all(&mut conn)
+                .await
+                .unwrap();
+        assert!(repair(&mut conn).await.is_err());
+        let after: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT name, sql FROM sqlite_master ORDER BY name")
+                .fetch_all(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(before, after);
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM FerrofinMeta")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        sqlx::query("DROP TRIGGER fail_backfill")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        repair(&mut conn).await.unwrap();
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn collisions_leave_username_schema_values_and_marker_untouched(
+        #[case] has_column: bool,
+    ) {
+        let mut conn = fixture(has_column).await;
+        sqlx::query("UPDATE Users SET Username = 'MÜNCHEN' WHERE Id = 'b'")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let before: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT name, sql FROM sqlite_master ORDER BY name")
+                .fetch_all(&mut conn)
+                .await
+                .unwrap();
+        let error = repair(&mut conn).await.unwrap_err();
+        assert!(matches!(error, DbError::UsernameCollision { .. }));
+        let message = error.to_string();
+        assert!(message.contains("münchen") && message.contains("MÜNCHEN"));
+        let after: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT name, sql FROM sqlite_master ORDER BY name")
+                .fetch_all(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(before, after);
+        let markers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM FerrofinMeta")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(markers, 0);
+        if has_column {
+            let key: String =
+                sqlx::query_scalar("SELECT NormalizedUsername FROM Users WHERE Id = 'a'")
+                    .fetch_one(&mut conn)
+                    .await
+                    .unwrap();
+            assert_eq!(key, "MüNCHEN");
+        }
+        // After the operator resolves the conflict, migration retries normally.
+        sqlx::query("UPDATE Users SET Username = 'different' WHERE Id = 'b'")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        repair(&mut conn).await.unwrap();
     }
 }

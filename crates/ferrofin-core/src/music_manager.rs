@@ -65,12 +65,15 @@ fn row_genres(row: &BaseItemEntity) -> Vec<String> {
 }
 
 /// C# `Jellyfin.Extensions.DistinctNames` — distinct, case-insensitive, first
-/// spelling wins, input order preserved.
+/// spelling wins, input order preserved. Diacritics are removed only from the key.
 fn distinct_names(names: Vec<String>) -> Vec<String> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     names
         .into_iter()
-        .filter(|n| seen.insert(n.to_lowercase()))
+        .filter(|n| {
+            let key = ferrofin_util::string_extensions::remove_diacritics(n);
+            seen.insert(ferrofin_util::string_extensions::upper_invariant(&key))
+        })
         .collect()
 }
 
@@ -297,6 +300,23 @@ mod tests {
     use crate::item_type_lookup::ItemTypeLookup;
     use crate::test_support::{seed_item, seed_item_genre, seed_named_item, test_db};
     use ferrofin_db::Database;
+
+    #[rstest::rstest]
+    #[case("ς", "σ", true)]
+    #[case("é", "E", true)]
+    #[case("𐐨", "𐐀", true)]
+    #[case("ı", "I", false)]
+    fn unicode_distinct_names(#[case] first: &str, #[case] second: &str, #[case] equal: bool) {
+        let expected = if equal {
+            vec![first]
+        } else {
+            vec![first, second]
+        };
+        assert_eq!(
+            super::distinct_names(vec![first.to_owned(), second.to_owned()]),
+            expected
+        );
+    }
 
     fn manager(db: &Database) -> FerrofinMusicManager {
         let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =

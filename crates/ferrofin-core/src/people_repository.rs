@@ -17,6 +17,8 @@
 //!   `max_list_order`, and the name range/substring predicates are applied as in
 //!   C#. The `is_favorite` user-data path is honored via a `UserData` join.
 
+use ferrofin_util::string_extensions::{lower_invariant, upper_invariant};
+
 use std::collections::HashMap;
 
 use async_trait::async_trait;
@@ -107,6 +109,68 @@ impl FerrofinPeopleRepository {
     fn person_item_id(&self, name: &str) -> Option<String> {
         let (mode, people_path) = self.identity.as_ref()?;
         item_type_lookup::person_item_id(mode, people_path, name).map(guid_to_db)
+    }
+
+    /// Keep a previous Ferrofin ID when it exists. No primary key or reference
+    /// is rewritten merely because the Unicode mapping has been corrected.
+    async fn resolved_person_item_id(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        name: &str,
+    ) -> Result<Option<String>, ServiceError> {
+        let Some(current) = self.person_item_id(name) else {
+            return Ok(None);
+        };
+        let Some((mode, root)) = self.identity.as_ref() else {
+            return Ok(None);
+        };
+        let path = item_type_lookup::person_path(root, name);
+        let previous =
+            item_type_lookup::previous_by_name_item_id(mode, BaseItemKind::Person, &path)
+                .map(guid_to_db);
+        if let Some(previous) = previous.filter(|previous| previous != &current) {
+            let exists: bool = sqlx::query_scalar(
+                r#"SELECT EXISTS(SELECT 1 FROM "BaseItems" WHERE "Id" = ?1 AND "Type" = ?2)"#,
+            )
+            .bind(&previous)
+            .bind(PERSON_TYPE_NAME)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(db_err)?;
+            if exists {
+                return Ok(Some(previous));
+            }
+        }
+        Ok(Some(current))
+    }
+
+    /// Reuse the library resolver's indexed clean-name match before minting
+    /// an ID. A refresh may change the spelling, so an old hash alone is not
+    /// sufficient to find every previously written item.
+    async fn person_item_id_for_write(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        name: &str,
+        fallback: &str,
+    ) -> Result<String, ServiceError> {
+        if self.identity.is_some() {
+            let stored: Option<String> = sqlx::query_scalar(
+                r#"SELECT "Id" FROM "BaseItems" WHERE "Type" = ?1 AND "CleanName" = ?2
+                   ORDER BY "SortName", "Id" LIMIT 1"#,
+            )
+            .bind(PERSON_TYPE_NAME)
+            .bind(crate::text_util::get_clean_value(name))
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(db_err)?;
+            if let Some(stored) = stored {
+                return Ok(stored);
+            }
+        }
+        Ok(self
+            .resolved_person_item_id(tx, name)
+            .await?
+            .unwrap_or_else(|| fallback.to_owned()))
     }
 
     /// The `Path` column of `name`'s `Person` row — `Person.GetPath(name)`,
@@ -252,7 +316,7 @@ impl FerrofinPeopleRepository {
             let Some(name) = name.as_deref().map(str::trim).filter(|n| !n.is_empty()) else {
                 continue;
             };
-            let Some(target) = self.person_item_id(name) else {
+            let Some(target) = self.resolved_person_item_id(&mut tx, name).await? else {
                 continue;
             };
             if old_id.eq_ignore_ascii_case(&target) {
@@ -549,32 +613,32 @@ fn push_predicates(qb: &mut QueryBuilder<'_, Sqlite>, filter: &InternalPeopleQue
         .as_ref()
         .filter(|s| !s.trim().is_empty())
     {
-        qb.push(r#" AND UPPER(p."Name") LIKE "#);
-        qb.push_bind(format!("%{}%", contains.to_uppercase()));
+        qb.push(r#" AND ferrofin_upper_invariant(p."Name") LIKE "#);
+        qb.push_bind(format!("%{}%", upper_invariant(contains)));
     }
     if let Some(prefix) = filter
         .name_starts_with
         .as_ref()
         .filter(|s| !s.trim().is_empty())
     {
-        qb.push(r#" AND p."Name" LIKE "#);
-        qb.push_bind(format!("{}%", prefix.to_lowercase()));
+        qb.push(r#" AND ferrofin_upper_invariant(p."Name") LIKE "#);
+        qb.push_bind(format!("{}%", upper_invariant(prefix)));
     }
     if let Some(less) = filter
         .name_less_than
         .as_ref()
         .filter(|s| !s.trim().is_empty())
     {
-        qb.push(r#" AND p."Name" < "#);
-        qb.push_bind(less.to_lowercase());
+        qb.push(r#" AND ferrofin_lower_invariant(p."Name") < "#);
+        qb.push_bind(lower_invariant(less));
     }
     if let Some(ge) = filter
         .name_starts_with_or_greater
         .as_ref()
         .filter(|s| !s.trim().is_empty())
     {
-        qb.push(r#" AND p."Name" >= "#);
-        qb.push_bind(ge.to_lowercase());
+        qb.push(r#" AND ferrofin_lower_invariant(p."Name") >= "#);
+        qb.push_bind(lower_invariant(ge));
     }
 }
 
@@ -1007,7 +1071,7 @@ impl PeopleRepository for FerrofinPeopleRepository {
             // every credit type — favorites written against it read back from
             // every surface. Falls back to the Peoples row id when the
             // identity seam is not wired (unit tests).
-            let item_id = self.person_item_id(name).unwrap_or_else(|| id.clone());
+            let item_id = self.person_item_id_for_write(&mut tx, name, &id).await?;
             if let Some(type_name) = person_type_name {
                 self.insert_person_item(&mut tx, type_name, name, &item_id)
                     .await?;
@@ -1187,7 +1251,7 @@ mod tests {
         );
     }
 
-    use super::FerrofinPeopleRepository;
+    use super::{FerrofinPeopleRepository, PERSON_TYPE_NAME};
     use crate::test_support::{seed_item, test_db};
     use ferrofin_db::entities::base_items::PeopleEntity;
     use ferrofin_db::store::guid_to_db;
@@ -1258,6 +1322,91 @@ mod tests {
         let people = batched.get(&movie).expect("item present");
         assert_eq!(role_of(people, "Bob Parity"), Some("Lead".to_owned()));
         assert_eq!(role_of(people, "Carol Ferrofin"), Some(String::new()));
+    }
+
+    #[rstest::rstest]
+    #[case("Élodie", "él")]
+    #[case("ΟΣ", "οσ")]
+    #[case("𐐀 Star", "𐐨")]
+    #[tokio::test]
+    async fn unicode_people_filters(#[case] name: &str, #[case] term: &str) {
+        let db = test_db().await;
+        let movie = Uuid::new_v4();
+        crate::test_support::seed_named_item(&db, movie, BaseItemKind::Movie, "Movie").await;
+        let repo = FerrofinPeopleRepository::new(db);
+        repo.update_people(movie, &[person(name, "Actor")])
+            .await
+            .unwrap();
+        for prefix in [true, false] {
+            let query = InternalPeopleQuery {
+                name_starts_with: prefix.then(|| term.to_owned()),
+                name_contains: (!prefix).then(|| term.to_owned()),
+                ..Default::default()
+            };
+            let result = repo.get_people(&query).await.unwrap();
+            assert_eq!(result.items.len(), 1);
+            assert_eq!(result.items[0].name, name);
+        }
+    }
+
+    #[rstest::rstest]
+    #[case("İpek")]
+    #[case("ΟΣ")]
+    #[tokio::test]
+    async fn unicode_identity_retains_existing_favorite(#[case] name: &str) {
+        use crate::item_type_lookup::{
+            IdDerivation, person_item_id, person_path, previous_by_name_item_id,
+        };
+        use crate::test_support::{seed_named_item, seed_user, seed_user_data};
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("People").to_string_lossy().into_owned();
+        let mode = IdDerivation::Jellyfin {
+            program_data_path: Some(tmp.path().to_string_lossy().into_owned()),
+        };
+        let old = previous_by_name_item_id(&mode, BaseItemKind::Person, &person_path(&root, name))
+            .unwrap();
+        let new = person_item_id(&mode, &root, name).unwrap();
+        assert_ne!(old, new);
+        seed_named_item(&db, old, BaseItemKind::Person, name).await;
+        crate::test_support::set_clean_name(&db, old, name).await;
+        let movie = Uuid::new_v4();
+        seed_named_item(&db, movie, BaseItemKind::Movie, "Movie").await;
+        let user_id = Uuid::new_v4();
+        seed_user(&db, user_id).await;
+        seed_user_data(&db, user_id, old, false, None).await;
+        sqlx::query(r#"UPDATE "UserData" SET "IsFavorite" = 1 WHERE "ItemId" = ?1"#)
+            .bind(guid_to_db(old))
+            .execute(db.writer())
+            .await
+            .unwrap();
+        let repo = FerrofinPeopleRepository::new(db.clone()).with_identity(mode, root);
+        assert_eq!(repo.unify_person_identities().await.unwrap(), 0);
+        for spelling in [
+            name.to_owned(),
+            ferrofin_util::string_extensions::lower_invariant(name),
+        ] {
+            let written = repo
+                .update_people(movie, &[person(&spelling, "Actor")])
+                .await
+                .unwrap();
+            assert_eq!(written[0].id, old);
+        }
+        let favorite: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM "UserData" WHERE "ItemId" = ?1 AND "IsFavorite" = 1"#,
+        )
+        .bind(guid_to_db(old))
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(favorite, 1);
+        let count: i64 =
+            sqlx::query_scalar(r#"SELECT COUNT(*) FROM "BaseItems" WHERE "Type" = ?1"#)
+                .bind(PERSON_TYPE_NAME)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[tokio::test]

@@ -1,0 +1,21 @@
+{{- if .Values.discovery.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ferrofin.fullname" . }}-discovery
+  labels:
+    {{- include "ferrofin.labels" . | nindent 4 }}
+  {{- with .Values.discovery.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.discovery.service.type }}
+  selector:
+    {{- include "ferrofin.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: discovery
+      port: 7359
+      targetPort: discovery
+      protocol: UDP
+{{- end }}
