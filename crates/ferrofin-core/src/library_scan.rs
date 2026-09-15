@@ -12644,13 +12644,10 @@ mod tests {
         // is on by default and the series has no provider id, so it keys on
         // `series-{name}-{lang}-{library}` — the children point at THAT key,
         // not at the series id.
-        let series_key: Option<String> = sqlx::query_scalar(
-            r#"SELECT "PresentationUniqueKey" FROM "BaseItems" WHERE "Id" = ?1"#,
-        )
-        .bind(&series_id)
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
+        let series_key: Option<String> =
+            crate::test_support::fetch_item(&db, uuid::Uuid::parse_str(&series_id).unwrap())
+                .await
+                .presentation_unique_key;
         let cf_simple = uuid::Uuid::parse_str(&cf).unwrap().as_simple().to_string();
         assert_eq!(
             series_key.as_deref(),

@@ -641,24 +641,18 @@ pub(crate) fn append_predicates<'a>(
         && filter.extra_types.is_empty()
         && !filter.include_owned_items
     {
-        // Exclude alternate versions + owned non-extra items from general queries.
-        //
-        // Two reasons to leave the alternates in, and they are the same
-        // predicate: a resume query wants the version that was actually
-        // played, and a grouped query collapses the versions itself. Upstream
-        // has no `PrimaryVersionId` predicate at all, and dropping the rows
-        // before the grouping removes 1,399 of them on a real library where
-        // the grouping merges only 299 — the other 1,100 are separate titles
-        // that simply have a primary version recorded.
-        if filter.is_resumable == Some(true) || group_by_presentation_unique_key(filter) {
+        // Exclude alternate versions + owned non-extra items from general
+        // queries — 12.0 `TranslateQuery.cs:806-815`, statement for statement:
+        // a resume query keeps the alternates so the version that was actually
+        // played surfaces instead of collapsing onto the primary; every other
+        // query hides every row with a `PrimaryVersionId`, including one whose
+        // primary no longer exists (12.0's own cleanup routines, not the
+        // query, are what remove those).
+        if filter.is_resumable == Some(true) {
             qb.push(" AND (")
                 .push(NO_OWNER)
                 .push(r#" OR bi."ExtraType" IS NOT NULL)"#);
         } else {
-            // Without a user there is no grouping (upstream's rule), so the
-            // alternates still have to be excluded somehow. Upstream carries no
-            // such predicate; this is the remaining divergence, and it only
-            // affects queries no user-facing endpoint issues.
             qb.push(r#" AND bi."PrimaryVersionId" IS NULL AND ("#)
                 .push(NO_OWNER)
                 .push(r#" OR bi."ExtraType" IS NOT NULL)"#);
