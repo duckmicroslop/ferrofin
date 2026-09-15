@@ -3902,6 +3902,7 @@ mod tests {
                 .await
                 .expect("count");
         assert_eq!(left, 0);
+    }
 
     /// The `rating_levels_v12` repair (Jellyfin 12.0 `MigrateRatingLevels`):
     /// every row's inherited rating columns are recomputed from its OWN
