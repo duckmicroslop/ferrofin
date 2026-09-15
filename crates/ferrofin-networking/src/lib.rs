@@ -19,14 +19,15 @@
 //! The [`ferrofin_model::net`] value types (`IpData`, `IpNetwork`,
 //! `AddressFamily`, `PublishedServerUriOverride`) are reused, not redefined.
 //!
-//! Deferred: the UDP `AutoDiscoveryHost`, the
-//! Happy-Eyeballs `HttpClientExtension` (reqwest does this itself), the UDP
-//! `SocketFactory`, OS network-change event wiring, and live interface
-//! enumeration.
+//! Live interface snapshots feed address selection; the UDP responder is in
+//! `ferrofin-core`. HTTP connection racing is handled by reqwest.
 
 pub mod config_keys;
 pub mod error;
+mod interfaces;
 pub mod logger;
+#[cfg(target_os = "macos")]
+mod macos_interfaces;
 pub mod manager;
 pub mod net_constants;
 pub mod net_utils;
@@ -36,5 +37,5 @@ pub mod remote_access_policy_result;
 pub use error::NetworkingError;
 pub use logger::{Logger, NullLogger};
 pub use manager::{NetworkManager, StartupConfig};
-pub use network_configuration::NetworkConfiguration;
+pub use network_configuration::{NetworkConfiguration, normalize_base_url};
 pub use remote_access_policy_result::RemoteAccessPolicyResult;
