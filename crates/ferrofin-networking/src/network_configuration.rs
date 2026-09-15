@@ -15,15 +15,21 @@
 //!
 //! ## What actually acts on these settings
 //!
-//! Almost nothing, yet. This document is persisted and served so the dashboard
-//! round-trips, and it is consumed by [`crate::manager::NetworkManager`] — the
-//! ported LAN / remote-access / bind resolver — which **the server does not
-//! construct** (`crates/ferrofin-api/src/auth.rs` explains why: its
-//! `Rc<dyn Logger>` is not `Send`). Request handling uses a fixed RFC1918
-//! check instead, so `LocalNetworkSubnets`, `KnownProxies`, `RemoteIPFilter`
-//! and `IsRemoteIPFilterBlacklist` are all settable and unenforced today.
-//! Wiring the manager into `AppState` is open work, and it is what makes these
-//! real — do not read a field's presence here as evidence it is applied.
+//! The server constructs one shared [`crate::manager::NetworkManager`] for HTTP
+//! access policy and peer-aware address advertisement. It applies configured LAN
+//! subnets, trusted proxies, remote-IP filters, interface selection and published
+//! subnet URL overrides. Saving the named network configuration updates this
+//! manager; live interfaces refresh at boot, on save and before peer URL resolution.
+//!
+//! `AutoDiscovery` is captured at the start of each server lifetime and controls
+//! the UDP 7359 listener. Changing it requires a restart. HTTP listener ports, the
+//! advertised global URL and the mounted base URL come from the server's bootstrap
+//! configuration (CLI/environment/config.toml), not this DTO's corresponding fields.
+//! In particular, use `FERROFIN_BASE_URL` or bootstrap `base_url` for the mounted
+//! prefix; saving `BaseUrl` here does not remount routes. Bootstrap settings require
+//! a process restart to reload. The composition root currently serves HTTP and
+//! disables request-Host URL selection; these DTO fields do not enable either HTTPS
+//! listening or request-Host selection by themselves.
 //!
 //! `EnableUPnP` is a different case, and not a Ferrofin gap: upstream marks it
 //! `[Obsolete("No longer supported")]`
@@ -94,7 +100,7 @@ pub struct NetworkConfiguration {
     /// The public HTTPS port.
     pub public_https_port: u16,
 
-    /// Whether auto-discovery is enabled.
+    /// Whether UDP server discovery is enabled (applied at server-lifetime startup).
     pub auto_discovery: bool,
 
     /// Whether to open the public ports with UPnP.
@@ -205,26 +211,11 @@ impl NetworkConfiguration {
         &self.base_url
     }
 
-    /// Sets the base URL, applying the C# `BaseUrl` setter normalization:
-    /// an empty/whitespace value becomes empty; otherwise a leading `/` is
-    /// ensured and any trailing `/` removed.
+    /// Sets the base URL: whitespace becomes empty, a leading `/` is ensured,
+    /// and trailing slashes are removed. Canonicalization is idempotent so URL
+    /// publication and HTTP mounting agree even on repeated configuration reads.
     pub fn set_base_url(&mut self, value: impl AsRef<str>) {
-        let value = value.as_ref();
-        if value.trim().is_empty() {
-            self.base_url = String::new();
-            return;
-        }
-
-        let mut normalized = value.to_owned();
-        if !normalized.starts_with('/') {
-            normalized.insert(0, '/');
-        }
-
-        if normalized.ends_with('/') {
-            normalized.pop();
-        }
-
-        self.base_url = normalized;
+        self.base_url = normalize_base_url(value.as_ref());
     }
 
     /// Builder-style [`Self::set_base_url`].
@@ -233,4 +224,19 @@ impl NetworkConfiguration {
         self.set_base_url(value);
         self
     }
+}
+
+/// Normalizes a base path for both URL publication and HTTP mounting.
+/// Removing every trailing slash keeps repeated normalization idempotent.
+#[must_use]
+pub fn normalize_base_url(value: &str) -> String {
+    if value.trim().is_empty() {
+        return String::new();
+    }
+    let mut normalized = value.to_owned();
+    if !normalized.starts_with('/') {
+        normalized.insert(0, '/');
+    }
+    normalized.truncate(normalized.trim_end_matches('/').len());
+    normalized
 }

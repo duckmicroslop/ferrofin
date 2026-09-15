@@ -50,15 +50,14 @@ use crate::bootstrap::FfmpegPaths;
 use crate::config::Config;
 use crate::media_encoding::build_media_encoding;
 
-/// The plugin-analysis decode budget: a quarter of the visible cores.
 /// Reads the saved network configuration, or the default when there is none.
 ///
-/// The same `{config}/named/network.json` that
+/// The same `{config}/users/named/network.json` that
 /// `GET/POST /System/Configuration/network` reads and writes — so what the
-/// dashboard shows is what the policy enforces. A file that cannot be parsed is
-/// reported and the defaults are used: an unreadable filter must not silently
-/// become a permissive one, and it must not stop the server from booting either
-/// (the operator would then have no way in to fix it).
+/// dashboard's policy settings feed the shared network manager. `AutoDiscovery`
+/// is sampled for each server lifetime; listener/base URL bootstrap settings are
+/// configured separately. Missing or unreadable files use defaults; malformed JSON
+/// also logs a warning that the remote-IP filter will not be enforced.
 async fn load_network_configuration(
     paths: &impl ferrofin_traits::system::ServerApplicationPaths,
 ) -> ferrofin_networking::NetworkConfiguration {
@@ -82,6 +81,7 @@ async fn load_network_configuration(
     }
 }
 
+/// The plugin-analysis decode budget: a quarter of the visible cores.
 fn num_cpus_for_analysis() -> usize {
     std::thread::available_parallelism().map_or(1, |n| n.get() / 4)
 }
@@ -118,6 +118,10 @@ const LIVE_STREAM_LOCAL_HOST: &str = "127.0.0.1";
 /// needs after wiring (the concrete host, to flip its startup flag and drive
 /// name refresh, and the lifecycle controller's restart flag).
 pub struct WiredApp {
+    /// Persisted identity shared by discovery and public system information.
+    pub server_id: String,
+    /// Snapshot of the persisted discovery setting for this server lifetime.
+    pub discovery_enabled: bool,
     /// The fully-wired shared state handed to every axum handler.
     pub state: AppState,
     /// The concrete host — the composition root calls
@@ -1748,20 +1752,31 @@ pub async fn build_app_state(
         task_manager.register(task);
     }
 
-    // ---- host + system + auth + quick-connect -----------------------------
-    let app_host = Arc::new(FerrofinServerApplicationHost::new(
-        Arc::clone(&paths),
-        Arc::clone(&config_trait),
-        HostNetworkInfo {
-            http_port: config.port,
-            https_port: config.https_port,
-            listen_with_https: false,
-            published_server_url: config.published_url.clone(),
-            base_url: config.base_url.clone(),
-            enable_published_server_uri_by_request: false,
-        },
-        config.server_name.clone(),
+    // One manager supplies peer-aware advertisement and HTTP access policy.
+    // Configuration saves update this same object through AppState.
+    let network_config = load_network_configuration(paths.as_ref()).await;
+    let discovery_enabled = network_config.auto_discovery;
+    let network = Arc::new(std::sync::RwLock::new(
+        ferrofin_networking::NetworkManager::live(network_config),
     ));
+
+    // ---- host + system + auth + quick-connect -----------------------------
+    let app_host = Arc::new(
+        FerrofinServerApplicationHost::new(
+            Arc::clone(&paths),
+            Arc::clone(&config_trait),
+            HostNetworkInfo {
+                http_port: config.port,
+                https_port: config.https_port,
+                listen_with_https: false,
+                published_server_url: config.published_url.clone(),
+                base_url: config.base_url.clone(),
+                enable_published_server_uri_by_request: false,
+            },
+            config.server_name.clone(),
+        )
+        .with_network(Arc::clone(&network), config.bind_addr),
+    );
     app_host
         .refresh_server_name()
         .await
@@ -1919,18 +1934,7 @@ pub async fn build_app_state(
         }
     }
 
-    // ---- network policy ---------------------------------------------------
-    // `LocalNetworkSubnets` / `RemoteIPFilter` / `EnableRemoteAccess` decide
-    // which peers count as local and which may reach the server at all. The
-    // policy was ported and tested in `ferrofin-networking` but never
-    // constructed, so every one of those settings was persisted, served back to
-    // the dashboard, and enforced nowhere. Built from the saved `network.json`
-    // (the same file `GET/POST /System/Configuration/network` reads and
-    // writes), and re-read into the running policy on every save.
-    let network_config = load_network_configuration(paths.as_ref()).await;
-    let network = Arc::new(std::sync::RwLock::new(
-        ferrofin_networking::NetworkManager::with_defaults(network_config, ""),
-    ));
+    // The host and HTTP policy share one network manager, constructed above.
     let state = state.with_network(network);
 
     // ---- virtual-folder (library-structure) store -------------------------
@@ -2042,6 +2046,8 @@ pub async fn build_app_state(
         .with_playback_metrics(playback_metrics);
 
     Ok(WiredApp {
+        server_id,
+        discovery_enabled,
         state,
         app_host,
         file_transformations,

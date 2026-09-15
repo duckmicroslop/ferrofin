@@ -24,8 +24,12 @@ use crate::state::AppState;
 /// Builds a [`RequestContext`] from an axum request's [`Parts`] (headers +
 /// query), mirroring the auth middleware's construction so the system manager
 /// sees the same request view.
-fn context_from_parts(parts: &Parts) -> RequestContext {
-    crate::auth::request_context(&parts.headers, parts.uri.query(), None)
+fn context_from_parts(state: &AppState, parts: &Parts) -> RequestContext {
+    crate::auth::request_context(
+        &parts.headers,
+        parts.uri.query(),
+        Some(state.client_address(parts).to_string()),
+    )
 }
 
 /// `GET /System/Info` — the full system information for an authenticated client.
@@ -44,7 +48,7 @@ async fn get_system_info(
     _auth: RequireAuth,
     parts: Parts,
 ) -> Result<Json<SystemInfo>, ApiError> {
-    let ctx = context_from_parts(&parts);
+    let ctx = context_from_parts(&state, &parts);
     let info = state.system.get_system_info(&ctx).await?;
     Ok(Json(info))
 }
@@ -62,7 +66,7 @@ async fn get_public_system_info(
     State(state): State<AppState>,
     parts: Parts,
 ) -> Result<Json<PublicSystemInfo>, ApiError> {
-    let ctx = context_from_parts(&parts);
+    let ctx = context_from_parts(&state, &parts);
     let info = state.system.get_public_system_info(&ctx).await?;
     Ok(Json(info))
 }
@@ -317,6 +321,58 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
 mod tests {
     use super::is_in_local_network;
     use std::net::IpAddr;
+
+    #[test]
+    fn system_context_preserves_transport_peer_and_resolves_only_trusted_proxies() {
+        use std::net::SocketAddr;
+        use std::sync::{Arc, RwLock};
+
+        use axum::extract::ConnectInfo;
+        use axum::http::Request;
+        use ferrofin_networking::{NetworkConfiguration, NetworkManager};
+
+        for (known_proxies, peer, expected) in [
+            (vec![], "192.168.1.50:5000", "192.168.1.50"),
+            (vec!["10.0.0.2".to_owned()], "10.0.0.2:5000", "192.168.2.60"),
+            (vec!["10.0.0.2".to_owned()], "10.0.0.3:5000", "10.0.0.3"),
+        ] {
+            let manager = NetworkManager::with_defaults(
+                NetworkConfiguration {
+                    known_proxies,
+                    ..Default::default()
+                },
+                "127.0.0.1/8,1,lo",
+            );
+            let state =
+                crate::test_support::fake_state().with_network(Arc::new(RwLock::new(manager)));
+            let (mut parts, ()) = Request::builder()
+                .uri("/System/Info/Public?api_key=test")
+                .header("host", "media.example.org")
+                .header("x-forwarded-for", "192.168.2.60")
+                .body(())
+                .expect("request")
+                .into_parts();
+            parts
+                .extensions
+                .insert(ConnectInfo(peer.parse::<SocketAddr>().expect("peer")));
+            let context = super::context_from_parts(&state, &parts);
+            assert_eq!(context.remote_endpoint.as_deref(), Some(expected));
+            assert_eq!(context.header("host"), Some("media.example.org"));
+            assert_eq!(context.query_string.as_deref(), Some("api_key=test"));
+        }
+    }
+
+    #[test]
+    fn system_context_defaults_missing_peer_to_loopback() {
+        let (parts, ()) = axum::http::Request::new(()).into_parts();
+        let state = crate::test_support::fake_state();
+        assert_eq!(
+            super::context_from_parts(&state, &parts)
+                .remote_endpoint
+                .as_deref(),
+            Some("127.0.0.1"),
+        );
+    }
 
     #[test]
     fn classifies_local_vs_public_addresses() {
