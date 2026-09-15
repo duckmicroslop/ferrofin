@@ -314,6 +314,7 @@ pub fn minimal_base_item(id: Uuid, name: &str, type_key: &str) -> BaseItemEntity
         normalization_gain: None,
         official_rating: None,
         original_title: None,
+        original_language: None,
         overview: None,
         owner_id: None,
         parent_id: None,
@@ -580,6 +581,7 @@ pub fn sample_user() -> UserEntity {
         subtitle_mode: 0,
         sync_play_access: 0,
         username: "bench".to_owned(),
+        normalized_username: "BENCH".to_owned(),
     }
 }
 
@@ -861,6 +863,7 @@ pub fn fake_user_entity(id: Uuid, username: &str) -> UserEntity {
         subtitle_mode: 0,
         sync_play_access: 0,
         username: username.to_owned(),
+        normalized_username: ferrofin_util::string_extensions::upper_invariant(username),
     }
 }
 

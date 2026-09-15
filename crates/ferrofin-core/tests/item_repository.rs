@@ -75,6 +75,7 @@ fn item(id: Uuid, kind: BaseItemKind, name: &str) -> BaseItemEntity {
         normalization_gain: None,
         official_rating: None,
         original_title: None,
+        original_language: None,
         overview: None,
         owner_id: None,
         parent_id: None,

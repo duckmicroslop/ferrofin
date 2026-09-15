@@ -81,6 +81,7 @@ fn user() -> UserEntity {
         subtitle_mode: 0,
         sync_play_access: 0,
         username: String::new(),
+        normalized_username: String::new(),
     }
 }
 
@@ -404,6 +405,7 @@ fn base_item() -> BaseItemEntity {
         normalization_gain: None,
         official_rating: None,
         original_title: None,
+        original_language: None,
         overview: None,
         owner_id: None,
         parent_id: None,

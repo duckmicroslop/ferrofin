@@ -224,6 +224,18 @@ pub fn equals_ordinal_ignore_case(left: &str, right: &str) -> bool {
         .eq(right.chars().map(to_upper_invariant))
 }
 
+/// `string.ToUpperInvariant()` — every character through the *simple*
+/// one-to-one uppercase mapping. A character whose full uppercase form is
+/// longer than one character (`ß` → `SS`, `ﬁ` → `FI`) is kept as it is, which
+/// is exactly what .NET does and what Rust's `str::to_uppercase` does not.
+///
+/// This is the key Jellyfin 12.0 stores in `Users.NormalizedUsername` and
+/// matches usernames on, so every lookup and every write must go through it.
+#[must_use]
+pub fn upper_invariant(text: &str) -> String {
+    text.chars().map(to_upper_invariant).collect()
+}
+
 /// `char.ToUpperInvariant` — the *simple* mapping, which by definition maps one
 /// character to one character. Rust's `char::to_uppercase` is the full mapping,
 /// so a character whose uppercase form is longer is left as it is.
@@ -386,5 +398,23 @@ mod tests {
         assert!(!equals_ordinal_ignore_case("straße", "STRASSE"));
         assert!(!equals_ordinal_ignore_case("\u{212a}elvin", "kelvin"));
         assert_eq!("\u{212a}".to_lowercase(), "k", "the trap this avoids");
+    }
+
+    /// `ToUpperInvariant` is the simple mapping: one char in, one char out.
+    #[rstest]
+    #[case("", "")]
+    #[case("alice", "ALICE")]
+    #[case("Alice Smith", "ALICE SMITH")]
+    #[case("münchen", "MÜNCHEN")]
+    #[case("þór", "ÞÓR")]
+    #[case("straße", "STRAßE")] // ß has no single-char uppercase → kept
+    #[case("ﬁlm", "ﬁLM")] // the ﬁ ligature expands under the full mapping → kept
+    #[case("ŉ", "ŉ")] // expands to ʼN under the full mapping → kept
+    #[case("ǆ", "Ǆ")] // a digraph with a one-char uppercase
+    #[case("Ωmega", "ΩMEGA")]
+    fn upper_invariant_is_the_simple_mapping(#[case] input: &str, #[case] expected: &str) {
+        assert_eq!(upper_invariant(input), expected);
+        // Idempotent, like the C#: normalising a stored key changes nothing.
+        assert_eq!(upper_invariant(expected), expected);
     }
 }
