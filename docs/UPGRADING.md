@@ -13,7 +13,8 @@ major-version upgrade.
 Back up the data directory before starting this version. On first boot migration `0030`
 rebuilds `BaseItems`, `Users`, `Permissions`, `Preferences` and `MediaStreamInfos` into
 Jellyfin 12.0's shape (the file is snapshotted to `jellyfin.db.pre-0030` first, next to
-the existing `jellyfin.db.pre-0007`), `0031` rebuilds one index and drops `sqlite_stat1`,
+the existing `jellyfin.db.pre-0007`; 12.0 ships the same shapes as fourteen of Ferrofin's
+own `BaseItems` indexes, so those are not recreated), `0031` rebuilds one index and drops `sqlite_stat1`,
 and `0032` folds Ferrofin's playlist/collection cache table into Jellyfin's
 `LinkedChildren`. Expect one longer start proportional to library size; a second boot is
 a no-op. Every file-backed boot now runs `PRAGMA foreign_key_check` (about 0.14 s on a

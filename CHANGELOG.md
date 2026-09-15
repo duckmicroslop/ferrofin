@@ -12,7 +12,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 
 ### Database
 - Converge the schema on Jellyfin 12.0 (migrations 0030–0032): table rebuilds with a
-  pre-rebuild snapshot, 12.0's index set, `LinkedChildren` as the only membership store
+  pre-rebuild snapshot, 12.0's index set (Ferrofin's 14 duplicate `BaseItems` indexes are
+  not recreated), `LinkedChildren` as the only membership store
+- Pin id-list queries to the primary key: 12.0 drops
+  `IX_BaseItems_Id_Type_IsFolder_IsVirtualItem`, and without the `+"Type"` pin the
+  planner scanned every row of the type (`detail:similar` 4.9 → 7.8 ms p50)
 - Adopt Jellyfin 12.0 databases in place alongside 10.11.8 (exact migration sets; an
   atomic adoption record drives the one-shot membership import)
 - Run `PRAGMA foreign_key_check` on every boot, not only after a migration
