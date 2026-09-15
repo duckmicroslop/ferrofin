@@ -949,7 +949,7 @@ impl FerrofinItemPersistenceService {
             };
             updated += result.rows_affected();
         }
-        Self::mark_repair_done(&mut tx, META_KEY).await?;
+        Self::mark_repair_done_in(&mut tx, META_KEY).await?;
         tx.commit().await.map_err(db_err)?;
         Ok(updated)
     }
@@ -1056,7 +1056,7 @@ impl FerrofinItemPersistenceService {
             .rows_affected();
         }
         updated += Self::recompute_season_keys(&mut tx, &new_keys, None).await?;
-        Self::mark_repair_done(&mut tx, META_KEY).await?;
+        Self::mark_repair_done_in(&mut tx, META_KEY).await?;
         tx.commit().await.map_err(db_err)?;
         Ok(updated)
     }
@@ -1110,20 +1110,9 @@ impl FerrofinItemPersistenceService {
         Ok(updated)
     }
 
-    /// Whether the one-shot repair recorded under `key` has already run on
-    /// this database.
-    async fn repair_done(&self, key: &str) -> Result<bool, ServiceError> {
-        let done = self
-            .db
-            .meta_get(key)
-            .await
-            .map_err(|e| ServiceError::Backend(e.to_string()))?;
-        Ok(done.as_deref() == Some("1"))
-    }
-
     /// Records the one-shot repair `key` as done, inside the repair's own
     /// transaction so a failed pass retries on the next boot.
-    async fn mark_repair_done(
+    async fn mark_repair_done_in(
         tx: &mut sqlx::Transaction<'_, Sqlite>,
         key: &str,
     ) -> Result<(), ServiceError> {
