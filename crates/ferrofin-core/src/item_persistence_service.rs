@@ -34,6 +34,14 @@ use crate::item_type_lookup::{MUSIC_GENRE_TYPES, stored_type_name};
 use crate::text_util::get_clean_value;
 use crate::translate_query::PLACEHOLDER_ID;
 
+/// Rows per partition for the one-shot startup repairs — upstream's
+/// `const int Limit = 10000` in every 12.0 `Refresh*` migration routine
+/// (`RefreshCleanNamesAndValues`, `RefreshForcedSortNames`). Each partition is
+/// read with one keyset query and its rewrites committed as one transaction,
+/// which bounds both the memory a pass holds and the length of any single
+/// write lock.
+const REPAIR_PARTITION: i64 = 10_000;
+
 /// Maps an `ItemValues.Type` discriminant to the stored `BaseItems.Type` name of
 /// its browsable by-name item, or [`None`] for value types with no browse tab
 /// (tags, artists — handled elsewhere).
@@ -623,93 +631,255 @@ impl FerrofinItemPersistenceService {
         let _ = self.changed.set(notifier);
     }
 
-    /// One-shot startup pass: rewrites every stored `CleanName` / `CleanValue`
-    /// that disagrees with [`get_clean_value`], recording completion in
-    /// `FerrofinMeta` so later boots skip it.
+    /// Whether the one-shot pass recorded under `key` in `FerrofinMeta` has
+    /// already run on this database.
+    async fn repair_done(&self, key: &str) -> Result<bool, ServiceError> {
+        let done = self
+            .db
+            .meta_get(key)
+            .await
+            .map_err(|e| ServiceError::Backend(e.to_string()))?;
+        Ok(done.as_deref() == Some("1"))
+    }
+
+    /// Records the one-shot pass under `key` as complete.
+    async fn mark_repair_done(&self, key: &str) -> Result<(), ServiceError> {
+        self.db
+            .meta_set(key, "1")
+            .await
+            .map_err(|e| ServiceError::Backend(e.to_string()))
+    }
+
+    /// One-shot startup pass — the port of Jellyfin 12.0's
+    /// `RefreshCleanNamesAndValues` migration routine
+    /// (`Jellyfin.Server/Migrations/Routines/20260610120000_RefreshCleanNamesAndValues.cs`).
     ///
-    /// Ferrofin used to compute the clean columns by also replacing punctuation
-    /// with spaces and collapsing whitespace, where C# `GetCleanValue` only
-    /// removes diacritics and lowercases. Databases written by those versions
-    /// hold `'h jon benjamin'` where the lookups now compute `'h. jon
-    /// benjamin'`, so every by-name resolution of a punctuated name — person,
-    /// studio, genre, tag — would miss until the next full scan rewrote the
-    /// row. A database adopted from Jellyfin already agrees, and this pass
-    /// leaves it untouched.
+    /// Rewrites `BaseItems.CleanName` from `Name` (rows with a non-empty
+    /// name, `Id` order) and then `ItemValues.CleanValue` from `Value`
+    /// (non-empty values, `ItemValueId` order) with [`get_clean_value`], in
+    /// partitions of [`REPAIR_PARTITION`] rows, writing only the rows whose
+    /// stored column disagrees — exactly the routine's loop, with each
+    /// partition's updates committed as one transaction where EF's
+    /// `SaveChangesAsync` runs per partition upstream. A whitespace-only source
+    /// stores the empty string, as upstream's `IsNullOrWhiteSpace ?
+    /// string.Empty : GetCleanValue()` does.
+    ///
+    /// Completion is recorded in `FerrofinMeta` under `clean_values_v12` so
+    /// later boots skip the pass. The key is new on purpose: the earlier marker
+    /// (`clean_values_keep_punctuation_v1`) recorded the 10.11.8 rule — fold
+    /// and lower-case, punctuation kept — and must not suppress this one.
+    ///
+    /// Why once per database: 12.0's `GetCleanValue` replaces punctuation with
+    /// spaces, and the query translator now computes that form, so every
+    /// stored `'h. jon benjamin'` would miss a lookup for `'h jon benjamin'`
+    /// until rewritten. A database Jellyfin 12.0 wrote already agrees and
+    /// reads back untouched (0 rewrites).
+    ///
+    /// Returns the number of rows rewritten (names + values).
     ///
     /// # Errors
     ///
-    /// Returns a [`ServiceError`] when a query or the rewrite transaction
-    /// fails; the marker is written inside that transaction, so a failure
-    /// simply retries on the next boot.
+    /// Returns a [`ServiceError`] when a read or a partition's write fails.
+    /// The marker is only written after the last partition, so a failed boot
+    /// resumes the whole pass next time; every step is idempotent.
     pub async fn repair_clean_values(&self) -> Result<u64, ServiceError> {
-        const META_KEY: &str = "clean_values_keep_punctuation_v1";
-        let done = self
-            .db
-            .meta_get(META_KEY)
-            .await
-            .map_err(|e| ServiceError::Backend(e.to_string()))?;
-        if done.as_deref() == Some("1") {
+        const META_KEY: &str = "clean_values_v12";
+        if self.repair_done(META_KEY).await? {
             return Ok(0);
         }
+        let repaired = self.refresh_clean_names().await? + self.refresh_clean_values().await?;
+        self.mark_repair_done(META_KEY).await?;
+        Ok(repaired)
+    }
 
-        let items: Vec<(String, Option<String>, Option<String>)> =
-            // The migration's placeholder row is excluded here as it is
-            // everywhere else — it has no name, and rewriting it would report
-            // work on a database that has nothing to repair.
-            sqlx::query_as(r#"SELECT "Id", "Name", "CleanName" FROM "BaseItems" WHERE "Id" <> ?1"#)
-                .bind(PLACEHOLDER_ID)
-                .fetch_all(self.db.pool())
-                .await
-                .map_err(db_err)?;
-        let values: Vec<(String, Option<String>, Option<String>)> =
-            sqlx::query_as(r#"SELECT "ItemValueId", "Value", "CleanValue" FROM "ItemValues""#)
-                .fetch_all(self.db.pool())
-                .await
-                .map_err(db_err)?;
-
-        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+    /// `RefreshCleanNamesAsync`: `BaseItems.CleanName` from `Name`, for every
+    /// row with a non-empty name, in `Id` order. Returns the rows rewritten.
+    async fn refresh_clean_names(&self) -> Result<u64, ServiceError> {
         let mut repaired: u64 = 0;
-        for (id, name, stored) in items {
-            let want = name.as_deref().map(get_clean_value);
-            if want.as_deref() == stored.as_deref()
-                || !was_written_by_the_old_rule(name.as_deref(), stored.as_deref())
-            {
-                continue;
+        let mut last_id = String::new();
+        loop {
+            let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+                r#"SELECT "Id", "Name", "CleanName" FROM "BaseItems"
+                   WHERE "Name" IS NOT NULL AND "Name" <> '' AND "Id" > ?1
+                   ORDER BY "Id" LIMIT ?2"#,
+            )
+            .bind(&last_id)
+            .bind(REPAIR_PARTITION)
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)?;
+            let Some((tail, _, _)) = rows.last() else {
+                break;
+            };
+            last_id.clone_from(tail);
+            let full_partition = rows.len() == usize::try_from(REPAIR_PARTITION).unwrap_or(0);
+
+            let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+            for (id, name, stored) in &rows {
+                let want = if name.trim().is_empty() {
+                    String::new()
+                } else {
+                    get_clean_value(name)
+                };
+                if stored.as_deref() == Some(want.as_str()) {
+                    continue;
+                }
+                sqlx::query(r#"UPDATE "BaseItems" SET "CleanName" = ?2 WHERE "Id" = ?1"#)
+                    .bind(id)
+                    .bind(&want)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+                repaired += 1;
             }
-            sqlx::query(r#"UPDATE "BaseItems" SET "CleanName" = ?2 WHERE "Id" = ?1"#)
-                .bind(&id)
+            tx.commit().await.map_err(db_err)?;
+            tracing::debug!(
+                through = %last_id,
+                repaired,
+                "clean-name repair partition committed"
+            );
+            if !full_partition {
+                break;
+            }
+        }
+        Ok(repaired)
+    }
+
+    /// `RefreshCleanValuesAsync`: `ItemValues.CleanValue` from `Value`, for
+    /// every row with a non-empty value, in `ItemValueId` order. Returns the
+    /// rows rewritten.
+    async fn refresh_clean_values(&self) -> Result<u64, ServiceError> {
+        let mut repaired: u64 = 0;
+        let mut last_id = String::new();
+        loop {
+            let rows: Vec<(String, String, String)> = sqlx::query_as(
+                r#"SELECT "ItemValueId", "Value", "CleanValue" FROM "ItemValues"
+                   WHERE "Value" <> '' AND "ItemValueId" > ?1
+                   ORDER BY "ItemValueId" LIMIT ?2"#,
+            )
+            .bind(&last_id)
+            .bind(REPAIR_PARTITION)
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)?;
+            let Some((tail, _, _)) = rows.last() else {
+                break;
+            };
+            last_id.clone_from(tail);
+            let full_partition = rows.len() == usize::try_from(REPAIR_PARTITION).unwrap_or(0);
+
+            let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+            for (id, value, stored) in &rows {
+                let want = if value.trim().is_empty() {
+                    String::new()
+                } else {
+                    get_clean_value(value)
+                };
+                if *stored == want {
+                    continue;
+                }
+                sqlx::query(
+                    r#"UPDATE "ItemValues" SET "CleanValue" = ?2 WHERE "ItemValueId" = ?1"#,
+                )
+                .bind(id)
                 .bind(&want)
                 .execute(&mut *tx)
                 .await
                 .map_err(db_err)?;
-            repaired += 1;
-        }
-        for (id, value, stored) in values {
-            // `CleanValue` is NOT NULL; a null `Value` cleans to the empty
-            // string rather than dropping the column.
-            let want = get_clean_value(value.as_deref().unwrap_or_default());
-            if Some(want.as_str()) == stored.as_deref()
-                || !was_written_by_the_old_rule(value.as_deref(), stored.as_deref())
-            {
-                continue;
+                repaired += 1;
             }
-            sqlx::query(r#"UPDATE "ItemValues" SET "CleanValue" = ?2 WHERE "ItemValueId" = ?1"#)
-                .bind(&id)
-                .bind(&want)
-                .execute(&mut *tx)
-                .await
-                .map_err(db_err)?;
-            repaired += 1;
+            tx.commit().await.map_err(db_err)?;
+            tracing::debug!(
+                through = %last_id,
+                repaired,
+                "clean-value repair partition committed"
+            );
+            if !full_partition {
+                break;
+            }
         }
-        sqlx::query(
-            r#"INSERT INTO "FerrofinMeta" ("Key", "Value") VALUES (?1, '1')
-               ON CONFLICT("Key") DO UPDATE SET "Value" = '1'"#,
-        )
-        .bind(META_KEY)
-        .execute(&mut *tx)
-        .await
-        .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
+        Ok(repaired)
+    }
+
+    /// One-shot startup pass — the port of Jellyfin 12.0's
+    /// `RefreshForcedSortNames` migration routine
+    /// (`Jellyfin.Server/Migrations/Routines/20260722120000_RefreshForcedSortNames.cs`).
+    ///
+    /// For every `BaseItems` row with a non-empty `ForcedSortName` (`Id`
+    /// order, partitions of [`REPAIR_PARTITION`]) recomputes `SortName` as
+    /// `GetSortName(ForcedSortName, Type != Person)` —
+    /// [`crate::kinds::forced_sort_name_for`] — and writes it only when it
+    /// differs from the stored value. 10.11.8 derived a forced sort name with
+    /// `ModifySortChunks(ForcedSortName).ToLowerInvariant()`, keeping the
+    /// article and the punctuation; 12.0 runs it through the full cleaning
+    /// pipeline so a forced `"The Spider-Man: Homecoming"` sorts next to the
+    /// auto-generated key (jellyfin#17388). A `Person` row keeps its override
+    /// verbatim apart from `TrimStart()`.
+    ///
+    /// Completion is recorded in `FerrofinMeta` under `forced_sort_names_v12`.
+    /// Returns the number of rows rewritten.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServiceError`] when a read or a partition's write fails; the
+    /// marker is written only after the last partition, so the pass resumes on
+    /// the next boot.
+    pub async fn repair_forced_sort_names(&self) -> Result<u64, ServiceError> {
+        const META_KEY: &str = "forced_sort_names_v12";
+        if self.repair_done(META_KEY).await? {
+            return Ok(0);
+        }
+        let mut repaired: u64 = 0;
+        let mut last_id = String::new();
+        loop {
+            let rows: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+                r#"SELECT "Id", "Type", "ForcedSortName", "SortName" FROM "BaseItems"
+                   WHERE "ForcedSortName" IS NOT NULL AND "ForcedSortName" <> '' AND "Id" > ?1
+                   ORDER BY "Id" LIMIT ?2"#,
+            )
+            .bind(&last_id)
+            .bind(REPAIR_PARTITION)
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)?;
+            let Some((tail, _, _, _)) = rows.last() else {
+                break;
+            };
+            last_id.clone_from(tail);
+            let full_partition = rows.len() == usize::try_from(REPAIR_PARTITION).unwrap_or(0);
+
+            let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+            for (id, type_name, forced, stored) in &rows {
+                // Upstream: `enableAlphaNumericSorting = Type != typeof(Person)`
+                // — every other type, known to Ferrofin or not, takes the
+                // alphanumeric branch.
+                let want = match crate::item_type_lookup::kind_from_type_name(type_name) {
+                    Some(kind) => crate::kinds::forced_sort_name_for(kind, forced),
+                    None => ferrofin_util::sort_name::forced_sort_key(forced),
+                };
+                if stored.as_deref() == Some(want.as_str()) {
+                    continue;
+                }
+                tracing::debug!(
+                    item_id = %id,
+                    old = ?stored,
+                    new = %want,
+                    "forced sort name recomputed"
+                );
+                sqlx::query(r#"UPDATE "BaseItems" SET "SortName" = ?2 WHERE "Id" = ?1"#)
+                    .bind(id)
+                    .bind(&want)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+                repaired += 1;
+            }
+            tx.commit().await.map_err(db_err)?;
+            if !full_partition {
+                break;
+            }
+        }
+        self.mark_repair_done(META_KEY).await?;
         Ok(repaired)
     }
 
@@ -730,7 +900,7 @@ impl FerrofinItemPersistenceService {
         // Same reasoning for `SortName`, and it is why this belongs here rather
         // than at each call site. In C# `SortName` is not a field a caller can
         // forget: `BaseItem.SortName` is a lazy property that resolves to
-        // `ModifySortChunks(ForcedSortName).ToLowerInvariant()` or
+        // `GetSortName(ForcedSortName, EnableAlphaNumericSorting, config)` or
         // `CreateSortName()` on first read, so `SaveItems` can never persist a
         // null. Modelled as a plain `Option` on the entity, every construction
         // site *could* forget — and several did, leaving 7,191 of 9,865 rows
@@ -743,16 +913,20 @@ impl FerrofinItemPersistenceService {
         // per-kind `CreateSortName` overrides (episode/season) the scanner
         // computes, which drive the client's play queue.
         //
-        // The fallback goes through `kinds::sort_name_for`, not
-        // `create_sort_name` directly, because `CreateSortName` has a per-kind
-        // branch: `Person` overrides `EnableAlphaNumericSorting => false` and
-        // keeps its name verbatim. Deriving the generic key for a `Person` here
-        // lower-cased rows the people repository had written correctly.
+        // Both fallbacks go through the kind-aware helpers in `kinds`, not
+        // `create_sort_name` / `forced_sort_key` directly, because `GetSortName`
+        // has a per-kind branch: `Person` overrides `EnableAlphaNumericSorting
+        // => false` and keeps its name — or its forced sort name — verbatim.
+        // Deriving the generic key for a `Person` here lower-cased rows the
+        // people repository had written correctly.
         let sort_kind = crate::item_type_lookup::kind_from_type_name(&item.type_);
         let sort_name = item.sort_name.clone().or_else(|| {
             let forced = item.forced_sort_name.as_deref().filter(|f| !f.is_empty());
             match forced {
-                Some(f) => Some(ferrofin_util::sort_name::forced_sort_key(f)),
+                Some(f) => Some(match sort_kind {
+                    Some(kind) => crate::kinds::forced_sort_name_for(kind, f),
+                    None => ferrofin_util::sort_name::forced_sort_key(f),
+                }),
                 None => item.name.as_deref().map(|n| match sort_kind {
                     Some(kind) => crate::kinds::sort_name_for(kind, n),
                     None => ferrofin_util::sort_name::create_sort_name(n),
@@ -1846,13 +2020,18 @@ pub async fn backfill_missing_sort_names(db: &Database) -> Result<usize, Service
 
     let mut tx = db.writer().begin().await.map_err(db_err)?;
     for (id, name, forced, type_name) in &rows {
-        // `Type` is selected so the per-kind `CreateSortName` branch applies:
-        // a `Person` keeps its name verbatim (`EnableAlphaNumericSorting =>
-        // false`). Backfilling the generic key here wrote the WRONG value into
-        // exactly the rows this function exists to repair.
+        // `Type` is selected so the per-kind `GetSortName` branch applies to
+        // both the derived and the forced key: a `Person` keeps its name
+        // verbatim (`EnableAlphaNumericSorting => false`). Backfilling the
+        // generic key here wrote the WRONG value into exactly the rows this
+        // function exists to repair.
+        let kind = crate::item_type_lookup::kind_from_type_name(type_name);
         let sort_name = match forced.as_deref().filter(|f| !f.is_empty()) {
-            Some(f) => ferrofin_util::sort_name::forced_sort_key(f),
-            None => match crate::item_type_lookup::kind_from_type_name(type_name) {
+            Some(f) => match kind {
+                Some(kind) => crate::kinds::forced_sort_name_for(kind, f),
+                None => ferrofin_util::sort_name::forced_sort_key(f),
+            },
+            None => match kind {
                 Some(kind) => crate::kinds::sort_name_for(kind, name),
                 None => ferrofin_util::sort_name::create_sort_name(name),
             },
@@ -2058,39 +2237,6 @@ fn incomplete_inputs(kind: BaseItemKind, item: &BaseItemEntity) -> bool {
         | BaseItemKind::MusicArtist => blank(item.name.as_ref()),
         _ => false,
     }
-}
-
-/// Whether `stored` is what Ferrofin's OLD clean rule would have produced for
-/// `source` — diacritics removed, lowercased, every other character collapsed
-/// to a single space, trimmed.
-///
-/// The repair pass rewrites a column only when this says yes, so it undoes
-/// Ferrofin's own damage and touches nothing else. Without the guard it would
-/// rewrite any row where the two implementations of diacritic folding disagree
-/// at all — including rows a Jellyfin install wrote, which is a silent mutation
-/// of someone else's data and breaks the two-way adoption guarantee.
-fn was_written_by_the_old_rule(source: Option<&str>, stored: Option<&str>) -> bool {
-    let (Some(source), Some(stored)) = (source, stored) else {
-        // A null clean column was never written by the old rule for a named
-        // row; filling it in is safe and is what a save would do anyway.
-        return stored.is_none();
-    };
-    let cleaned = get_clean_value(source);
-    let old: String = {
-        let mut out = String::with_capacity(cleaned.len());
-        let mut last_was_space = false;
-        for ch in cleaned.chars() {
-            if ch.is_alphabetic() || ch.is_numeric() {
-                out.push(ch);
-                last_was_space = false;
-            } else if !last_was_space {
-                out.push(' ');
-                last_was_space = true;
-            }
-        }
-        out.trim().to_owned()
-    };
-    stored == old
 }
 
 /// Stamps a row's `PresentationUniqueKey` directly, for tests that need a
@@ -2604,18 +2750,37 @@ mod tests {
         );
     }
 
-    // `ForcedSortName` short-circuits `CreateSortName` in C#: it is padded and
-    // lower-cased, but its articles and punctuation are left alone.
+    // A `ForcedSortName` wins over the name, and since 12.0 it goes through
+    // the same `GetSortName` cleaning as an auto-generated key (article and
+    // remove-characters stripped, digits padded, lower-cased).
     #[tokio::test]
     async fn save_items_derives_from_a_forced_sort_name_when_present() {
         let db = test_db().await;
         let entity = ferrofin_db::entities::base_items::BaseItemEntity {
             forced_sort_name: Some("The Matrix 2".to_owned()),
-            ..named("The Matrix")
+            ..named("Unrelated")
         };
         assert_eq!(
             persisted_sort_name(&db, entity).await.as_deref(),
-            Some("the matrix 0000000002")
+            Some("matrix 0000000002")
+        );
+    }
+
+    // …except for a `Person`, whose `EnableAlphaNumericSorting => false`
+    // sends the forced name down the verbatim `TrimStart()` branch too.
+    #[tokio::test]
+    async fn save_items_keeps_a_person_forced_sort_name_verbatim() {
+        let db = test_db().await;
+        let entity = ferrofin_db::entities::base_items::BaseItemEntity {
+            type_: stored_type_name(BaseItemKind::Person)
+                .expect("person type")
+                .to_owned(),
+            forced_sort_name: Some("  Parity, Alice".to_owned()),
+            ..named("Alice Parity")
+        };
+        assert_eq!(
+            persisted_sort_name(&db, entity).await.as_deref(),
+            Some("Parity, Alice")
         );
     }
 
@@ -3018,48 +3183,199 @@ mod tests {
         assert_eq!(name.as_deref(), Some("Renamed.File.2011"));
     }
 
-    /// A database written by a Ferrofin version whose `get_clean_value`
-    /// stripped punctuation is repaired in place on the next boot — otherwise a
-    /// person, studio or genre with a `.` or `-` in its name stays unreachable
-    /// by name until someone runs a full rescan.
+    /// The port of 12.0's `RefreshCleanNamesAndValues`: a database written
+    /// under 10.11.8's rule (fold + lower-case, punctuation kept) is moved to
+    /// the 12.0 form once, names and values alike, and a second boot does
+    /// nothing. The 10.11.8-era marker must not suppress the pass.
     #[tokio::test]
-    async fn the_clean_value_repair_rewrites_stale_columns_once() {
+    async fn the_clean_value_repair_rewrites_10_11_8_columns_once() {
         let db = test_db().await;
         let service = FerrofinItemPersistenceService::new(db.clone());
-        let id = Uuid::from_u128(0xC1EA);
-        crate::test_support::seed_named_item(&db, id, BaseItemKind::Person, "H. Jon Benjamin")
+        // The marker the previous repair (which kept punctuation) left behind.
+        db.meta_set("clean_values_keep_punctuation_v1", "1")
+            .await
+            .expect("old marker");
+
+        let person = Uuid::from_u128(0xC1EA);
+        crate::test_support::seed_named_item(&db, person, BaseItemKind::Person, "H. Jon Benjamin")
             .await;
-        // The stale spelling the old rule produced.
-        sqlx::query(r#"UPDATE "BaseItems" SET "CleanName" = 'h jon benjamin' WHERE "Id" = ?1"#)
-            .bind(ferrofin_db::store::guid_to_db(id))
+        sqlx::query(r#"UPDATE "BaseItems" SET "CleanName" = 'h. jon benjamin' WHERE "Id" = ?1"#)
+            .bind(guid_to_db(person))
             .execute(db.writer())
             .await
-            .expect("stale clean name");
+            .expect("10.11.8 clean name");
+        let movie = Uuid::from_u128(0xC1EB);
+        crate::test_support::seed_named_item(&db, movie, BaseItemKind::Movie, "Dune: Part Two")
+            .await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "CleanName" = 'dune: part two' WHERE "Id" = ?1"#)
+            .bind(guid_to_db(movie))
+            .execute(db.writer())
+            .await
+            .expect("10.11.8 clean name");
+        // Already in the 12.0 form: read, compared, not counted.
+        let settled = Uuid::from_u128(0xC1EC);
+        crate::test_support::seed_named_item(&db, settled, BaseItemKind::Movie, "Heat").await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "CleanName" = 'heat' WHERE "Id" = ?1"#)
+            .bind(guid_to_db(settled))
+            .execute(db.writer())
+            .await
+            .expect("settled clean name");
         sqlx::query(
-            r#"INSERT INTO "ItemValues" ("ItemValueId","Type","Value","CleanValue")
-               VALUES (1, 3, 'Warner Bros. Pictures', 'warner bros pictures')"#,
+            r#"INSERT INTO "ItemValues" ("ItemValueId","Type","Value","CleanValue") VALUES
+               ('v1', 3, 'Warner Bros. Pictures', 'warner bros. pictures'),
+               ('v2', 2, 'Mötley Crüe', 'motley crue'),
+               ('v3', 1, 'Sci-Fi', 'sci-fi')"#,
         )
         .execute(db.writer())
         .await
-        .expect("stale clean value");
+        .expect("10.11.8 clean values");
 
-        assert_eq!(service.repair_clean_values().await.expect("repair"), 2);
-        let clean: Option<String> =
-            sqlx::query_scalar(r#"SELECT "CleanName" FROM "BaseItems" WHERE "Id" = ?1"#)
-                .bind(ferrofin_db::store::guid_to_db(id))
+        // 2 stale names + 2 stale values, plus migration 0001's placeholder
+        // row: it has a `Name` and a NULL `CleanName`, and upstream's
+        // `Where(!IsNullOrEmpty(Name))` takes it along. The settled rows are
+        // read, compared and left alone.
+        assert_eq!(service.repair_clean_values().await.expect("repair"), 5);
+        let clean = |id: Uuid| {
+            let db = db.clone();
+            async move {
+                sqlx::query_scalar::<_, Option<String>>(
+                    r#"SELECT "CleanName" FROM "BaseItems" WHERE "Id" = ?1"#,
+                )
+                .bind(guid_to_db(id))
                 .fetch_one(db.pool())
                 .await
-                .expect("read back");
-        assert_eq!(clean.as_deref(), Some("h. jon benjamin"));
-        let value: String =
-            sqlx::query_scalar(r#"SELECT "CleanValue" FROM "ItemValues" WHERE "ItemValueId" = 1"#)
-                .fetch_one(db.pool())
-                .await
-                .expect("read back");
-        assert_eq!(value, "warner bros. pictures");
+                .expect("read back")
+            }
+        };
+        assert_eq!(clean(person).await.as_deref(), Some("h jon benjamin"));
+        assert_eq!(clean(movie).await.as_deref(), Some("dune part two"));
+        assert_eq!(clean(settled).await.as_deref(), Some("heat"));
+        assert_eq!(
+            clean(Uuid::from_u128(1)).await.as_deref(),
+            Some(
+                "this is a placeholder item for userdata that has been detached from its original item"
+            )
+        );
+        let values: Vec<(String, String)> = sqlx::query_as(
+            r#"SELECT "ItemValueId", "CleanValue" FROM "ItemValues" ORDER BY "ItemValueId""#,
+        )
+        .fetch_all(db.pool())
+        .await
+        .expect("read back");
+        assert_eq!(
+            values,
+            vec![
+                ("v1".to_owned(), "warner bros pictures".to_owned()),
+                ("v2".to_owned(), "motley crue".to_owned()),
+                ("v3".to_owned(), "sci fi".to_owned()),
+            ]
+        );
 
-        // Once only: the marker means a second boot does no work.
+        // Once only: the marker means a second boot does no work — even for a
+        // row that drifted after the pass.
+        sqlx::query(r#"UPDATE "BaseItems" SET "CleanName" = 'h. jon benjamin' WHERE "Id" = ?1"#)
+            .bind(guid_to_db(person))
+            .execute(db.writer())
+            .await
+            .expect("drift");
         assert_eq!(service.repair_clean_values().await.expect("repair"), 0);
+        assert_eq!(clean(person).await.as_deref(), Some("h. jon benjamin"));
+        assert_eq!(
+            db.meta_get("clean_values_v12")
+                .await
+                .expect("meta")
+                .as_deref(),
+            Some("1")
+        );
+    }
+
+    /// The port of 12.0's `RefreshForcedSortNames`: every row with a forced
+    /// sort name gets `GetSortName(ForcedSortName, Type != Person)`, written
+    /// only when it changed; rows without a forced name are never touched; the
+    /// pass runs once.
+    #[tokio::test]
+    async fn the_forced_sort_name_repair_recomputes_12_0_keys_once() {
+        async fn force(db: &ferrofin_db::Database, id: Uuid, forced: &str, sort: &str) {
+            sqlx::query(
+                r#"UPDATE "BaseItems" SET "ForcedSortName" = ?2, "SortName" = ?3 WHERE "Id" = ?1"#,
+            )
+            .bind(guid_to_db(id))
+            .bind(forced)
+            .bind(sort)
+            .execute(db.writer())
+            .await
+            .expect("forced row");
+        }
+        async fn sort_name(db: &ferrofin_db::Database, id: Uuid) -> Option<String> {
+            sqlx::query_scalar(r#"SELECT "SortName" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(guid_to_db(id))
+                .fetch_one(db.pool())
+                .await
+                .expect("read back")
+        }
+
+        let db = test_db().await;
+        let service = FerrofinItemPersistenceService::new(db.clone());
+        // 10.11.8 stored `ModifySortChunks(forced).ToLowerInvariant()`.
+        let movie = Uuid::from_u128(0xF0C1);
+        crate::test_support::seed_named_item(&db, movie, BaseItemKind::Movie, "zzz unrelated")
+            .await;
+        force(
+            &db,
+            movie,
+            "The Spider-Man: Homecoming",
+            "the spider-man: homecoming",
+        )
+        .await;
+        let sequel = Uuid::from_u128(0xF0C2);
+        crate::test_support::seed_named_item(&db, sequel, BaseItemKind::Series, "Matrix").await;
+        force(&db, sequel, "The Matrix 2", "the matrix 0000000002").await;
+        // A person keeps the override verbatim, trimmed at the start only.
+        let person = Uuid::from_u128(0xF0C3);
+        crate::test_support::seed_named_item(&db, person, BaseItemKind::Person, "Alice Parity")
+            .await;
+        force(&db, person, "  Parity, Alice", "parity, alice").await;
+        // Already the 12.0 key: read, compared, not counted.
+        let settled = Uuid::from_u128(0xF0C4);
+        crate::test_support::seed_named_item(&db, settled, BaseItemKind::Movie, "Heat").await;
+        force(&db, settled, "Heat 2", "heat 0000000002").await;
+        // No override: never part of the pass, whatever its SortName holds.
+        let plain = Uuid::from_u128(0xF0C5);
+        crate::test_support::seed_named_item(&db, plain, BaseItemKind::Movie, "The Plain").await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "SortName" = 'left alone' WHERE "Id" = ?1"#)
+            .bind(guid_to_db(plain))
+            .execute(db.writer())
+            .await
+            .expect("plain row");
+
+        assert_eq!(service.repair_forced_sort_names().await.expect("repair"), 3);
+        assert_eq!(
+            sort_name(&db, movie).await.as_deref(),
+            Some("spiderman: homecoming")
+        );
+        assert_eq!(
+            sort_name(&db, sequel).await.as_deref(),
+            Some("matrix 0000000002")
+        );
+        assert_eq!(
+            sort_name(&db, person).await.as_deref(),
+            Some("Parity, Alice")
+        );
+        assert_eq!(
+            sort_name(&db, settled).await.as_deref(),
+            Some("heat 0000000002")
+        );
+        assert_eq!(sort_name(&db, plain).await.as_deref(), Some("left alone"));
+
+        // Second boot: nothing to do.
+        assert_eq!(service.repair_forced_sort_names().await.expect("repair"), 0);
+        assert_eq!(
+            db.meta_get("forced_sort_names_v12")
+                .await
+                .expect("meta")
+                .as_deref(),
+            Some("1")
+        );
     }
 
     /// A stored key that the per-kind rule cannot reproduce is never

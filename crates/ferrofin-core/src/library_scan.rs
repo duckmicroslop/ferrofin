@@ -3286,7 +3286,7 @@ impl LibraryScanner {
                 // `ForcedSortName` when the item has one, so this does too.
                 entity.name.clone_from(&stored.name);
                 entity.sort_name = match entity.forced_sort_name.as_deref() {
-                    Some(forced) => Some(ferrofin_util::sort_name::forced_sort_key(forced)),
+                    Some(forced) => Some(forced_sort_name(entity, forced)),
                     None => stored
                         .name
                         .as_deref()
@@ -7207,6 +7207,18 @@ fn season_sort_name(index: Option<i64>, name: &str) -> String {
 /// The sort name a row derives from `title`, honouring the per-kind
 /// `CreateSortName` overrides (episodes and seasons sort by number, everything
 /// else by the name pipeline).
+/// The `SortName` a non-empty `ForcedSortName` yields for `entity` — 12.0's
+/// `GetSortName(ForcedSortName, EnableAlphaNumericSorting, config)`, so a
+/// `Person` keeps it verbatim and every other kind cleans it like a derived
+/// key. The per-kind `CreateSortName` overrides in [`derived_sort_name`] do not
+/// apply to the forced branch.
+fn forced_sort_name(entity: &BaseItemEntity, forced: &str) -> String {
+    match crate::item_type_lookup::kind_from_type_name(&entity.type_) {
+        Some(kind) => crate::kinds::forced_sort_name_for(kind, forced),
+        None => ferrofin_util::sort_name::forced_sort_key(forced),
+    }
+}
+
 fn derived_sort_name(entity: &BaseItemEntity, title: &str) -> String {
     match entity.type_.rsplit('.').next().unwrap_or(&entity.type_) {
         "Episode" => episode_sort_name(entity.parent_index_number, entity.index_number, title),

@@ -361,16 +361,31 @@ pub async fn build_app_state(
     let item_persistence_impl = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
     let item_persistence_service: Arc<dyn ferrofin_traits::persistence::ItemPersistenceService> =
         Arc::clone(&item_persistence_impl) as _;
-    // One-shot: rewrite clean columns written by a Ferrofin version whose
-    // `get_clean_value` stripped punctuation, so by-name lookups of a
-    // punctuated name resolve without waiting for a full rescan.
+    // One-shot (12.0 `RefreshCleanNamesAndValues`): move every stored
+    // `CleanName`/`CleanValue` written under 10.11.8's rule to the 12.0 form
+    // the query translator now computes, so by-name lookups of a punctuated
+    // name resolve without waiting for a full rescan.
     match item_persistence_impl.repair_clean_values().await {
         Ok(0) => {}
         Ok(repaired) => {
-            tracing::info!(repaired, "rewrote clean name/value columns");
+            tracing::info!(
+                repaired,
+                "rewrote clean name/value columns to the 12.0 form"
+            );
         }
         Err(err) => {
-            tracing::warn!(%err, "clean-value repair failed; punctuated by-name lookups may miss until the next scan");
+            tracing::warn!(%err, "clean-value repair failed; punctuated by-name lookups may miss until the next boot retries it");
+        }
+    }
+    // One-shot (12.0 `RefreshForcedSortNames`): a forced sort name now goes
+    // through the full `GetSortName` cleaning, so recompute every stored one.
+    match item_persistence_impl.repair_forced_sort_names().await {
+        Ok(0) => {}
+        Ok(repaired) => {
+            tracing::info!(repaired, "recomputed sort names from forced sort names");
+        }
+        Err(err) => {
+            tracing::warn!(%err, "forced sort-name repair failed; items with a sort-title override may sort by the 10.11.8 key until the next boot retries it");
         }
     }
     let people_repository_impl = Arc::new(
