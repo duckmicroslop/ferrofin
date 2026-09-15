@@ -23,6 +23,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   membership import)
 - Run `PRAGMA foreign_key_check` on every boot, not only after a migration
 
+### Tooling
+- `adoption/`: an adoption smoke harness that runs every supported Jellyfin generation
+  (10.11.8, 10.11.11, 12.0, 12.1) through an image on fresh fixture copies and diffs the
+  answers against Jellyfin 12.1's own; fixtures are derived from one supplied 10.11.8 snapshot
+
 ### Parity
 - Port Jellyfin 12.0's data routines: linked-children move, orphaned extras, OwnerId
   relationships, version links, `GetCleanValue`, forced sort names, localized user-view

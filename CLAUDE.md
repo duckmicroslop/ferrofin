@@ -288,6 +288,13 @@ pin a chosen plan; `crates/ferrofin-core/tests/next_up_query_plan.rs` pins the o
 a query stays *off* a `CROSS JOIN`. `ANALYZE` is deliberately unused and `sqlite_stat1`
 never exists.
 
+### Adoption has its own live check — `adoption/`
+`adoption/run.sh --fixtures DIR --image ferrofin:bench` adopts a real 10.11.8, 10.11.11, 12.0
+and 12.1 database (fixtures you supply and build once with `adoption/build-fixtures.sh`; never
+committed) on fresh copies and checks generation, migrations, Jellyfin 12.1's own smoke answers,
+file integrity and a repair-free second boot. Run it for any change to the migration chain,
+the adoption gate or the boot repairs — see `adoption/README.md`.
+
 ### Green tests are necessary, not sufficient
 Several real bugs in this codebase passed their unit/integration tests and were caught only
 by **running the server and exercising it over real HTTP** (e.g. login once returned no

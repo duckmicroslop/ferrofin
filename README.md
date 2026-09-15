@@ -158,6 +158,10 @@ Jellyfin, while the original spelling remains visible. If existing usernames col
 under these rules, startup stops with the conflicting account IDs and names; resolve
 the names in the original server before retrying. Accounts are never merged.
 
+Every supported generation is exercised end to end by [`adoption/`](adoption/README.md), which
+adopts real 10.11.8, 10.11.11, 12.0 and 12.1 databases on fresh copies and diffs the answers
+against Jellyfin 12.1's own.
+
 > ### ⚠ Migration is one-way. Back up first.
 >
 > Adopting the database runs Ferrofin's own migrations on it. Some of those rebuild
