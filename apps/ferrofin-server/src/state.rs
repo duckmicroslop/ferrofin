@@ -750,6 +750,47 @@ pub async fn build_app_state(
     );
     let virtual_folders: Arc<dyn ferrofin_traits::library::VirtualFolderManager> =
         virtual_folders_impl.clone();
+    // One-shot (Jellyfin 12.0 `MigrateRatingLevels`): recompute every row's
+    // inherited parental-rating columns from its OWN `OfficialRating` through
+    // `GetRatingScore`, so a rating string a 10.11/11.x build scored
+    // differently (or not at all) reads back under 12.0's tables.
+    match item_persistence_impl
+        .repair_rating_levels(localization.as_ref())
+        .await
+    {
+        Ok(0) => {}
+        Ok(repaired) => {
+            tracing::info!(
+                repaired,
+                "recomputed parental rating levels from rating strings"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(%err, "parental rating level repair failed; max-rating filters may misjudge until the next scan");
+        }
+    }
+    // One-shot (Jellyfin 12.0 `RecomputeSeriesPresentationKey`): rekey every
+    // series under 12.0's `Series.CreatePresentationUniqueKey` (name fallback,
+    // ordered library folders) and re-point its seasons/episodes by `SeriesId`.
+    // Reads `EnableAutomaticSeriesGrouping` and the preferred metadata language
+    // off each library's options, then the server's.
+    match virtual_folders.get_virtual_folders().await {
+        Ok(folders) => match item_persistence_impl
+            .repair_series_presentation_keys(&folders, &server_config.preferred_metadata_language)
+            .await
+        {
+            Ok(0) => {}
+            Ok(repaired) => {
+                tracing::info!(repaired, "recomputed series presentation keys");
+            }
+            Err(err) => {
+                tracing::warn!(%err, "series presentation key repair failed; grouped series may list per library until the next scan");
+            }
+        },
+        Err(err) => {
+            tracing::warn!(%err, "could not list libraries; series presentation key repair skipped until the next boot");
+        }
+    }
 
     // Lyrics: sidecars for an audio item plus the remote providers. The
     // internal-metadata root is where an uploaded/downloaded lyric always
@@ -932,6 +973,9 @@ pub async fn build_app_state(
     .with_localization(Arc::new(LocalizationManager::new(
         &server_config.metadata_country_code,
     )))
+    // `ServerConfiguration.PreferredMetadataLanguage`, the last fallback a
+    // series' presentation key embeds (`Series.AddLibrariesToPresentationUniqueKey`).
+    .with_default_metadata_language(server_config.preferred_metadata_language.clone())
     // Probe each media file during the scan (duration/size + per-stream codecs)
     // so the web client can pick direct play and the transcoder has stream info.
     .with_probe(
