@@ -1085,10 +1085,47 @@ fn append_user_data_predicates(qb: &mut QueryBuilder<'_, Sqlite>, filter: &Inter
         push_user_data_exists(qb, &uid, r#"ud."Rating" >= 6.5"#, want);
     }
     if let Some(want) = filter.is_played {
-        push_user_data_exists(qb, &uid, r#"ud."Played" = 1"#, want);
+        push_is_played(qb, &uid, want);
     }
     if let Some(want) = filter.is_resumable {
         push_resumable_predicate(qb, &uid, want);
+    }
+}
+
+/// `IsPlayed` for a leaf — v12 `BuildLeafIsPlayedFilter`
+/// (`TranslateQuery.cs:50-67`): the item has a played row of its own, OR it
+/// is the primary of a version group in which any version (itself included)
+/// has one, OR it is a version whose group's primary is such a primary.
+/// Alternates are hidden from general queries, so this is what lets the
+/// version that was actually watched mark the title played. Same
+/// uncorrelated-`IN` shape as [`push_user_data_exists`], for the same plan.
+fn push_is_played(qb: &mut QueryBuilder<'_, Sqlite>, user_id: &str, want: bool) {
+    let played_groups = |qb: &mut QueryBuilder<'_, Sqlite>| {
+        qb.push(r#"(SELECT v."PrimaryVersionId" FROM "BaseItems" v WHERE v."PrimaryVersionId" IS NOT NULL AND EXISTS (SELECT 1 FROM "UserData" ud WHERE ud."UserId" = "#)
+            .push_bind(user_id.to_owned())
+            .push(r#" AND ud."Played" = 1 AND (ud."ItemId" = v."Id" OR ud."ItemId" = v."PrimaryVersionId")))"#);
+    };
+    let played_items = |qb: &mut QueryBuilder<'_, Sqlite>| {
+        qb.push(r#"(SELECT ud."ItemId" FROM "UserData" ud WHERE ud."UserId" = "#)
+            .push_bind(user_id.to_owned())
+            .push(r#" AND ud."Played" = 1)"#);
+    };
+    if want {
+        qb.push(r#" AND (bi."Id" IN "#);
+        played_items(qb);
+        qb.push(r#" OR bi."Id" IN "#);
+        played_groups(qb);
+        qb.push(r#" OR (bi."PrimaryVersionId" IS NOT NULL AND bi."PrimaryVersionId" IN "#);
+        played_groups(qb);
+        qb.push("))");
+    } else {
+        qb.push(r#" AND bi."Id" NOT IN "#);
+        played_items(qb);
+        qb.push(r#" AND bi."Id" NOT IN "#);
+        played_groups(qb);
+        qb.push(r#" AND (bi."PrimaryVersionId" IS NULL OR bi."PrimaryVersionId" NOT IN "#);
+        played_groups(qb);
+        qb.push(")");
     }
 }
 

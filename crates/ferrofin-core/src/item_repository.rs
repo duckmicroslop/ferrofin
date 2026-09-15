@@ -7113,4 +7113,67 @@ mod tests {
         assert_eq!(music.items.len(), 1);
         assert_eq!(music.items[0].counts, ItemCounts::default());
     }
+
+    /// v12 `BuildLeafIsPlayedFilter`: a version group is played when any of
+    /// its versions is. The alternate is hidden from the general query, so it
+    /// is the primary that must answer `IsPlayed` for the version the user
+    /// actually watched.
+    #[tokio::test]
+    async fn is_played_counts_a_version_group_played_through_its_alternate() {
+        use crate::test_support::{seed_library_over, seed_user_data, seed_user_with_defaults};
+        let db = test_db().await;
+        let repository = crate::test_support::item_repository_over(db.clone());
+        let user = seed_user_with_defaults(&db, Uuid::from_u128(0xE4FF)).await;
+        let user_id = Uuid::parse_str(&user.id).expect("user id");
+        let (primary, alternate, other) = (
+            Uuid::from_u128(0xE401),
+            Uuid::from_u128(0xE402),
+            Uuid::from_u128(0xE403),
+        );
+        for id in [primary, alternate, other] {
+            seed_item(&db, id, BaseItemKind::Movie).await;
+        }
+        seed_library_over(&db, &[primary, alternate, other]).await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "PrimaryVersionId" = ?2 WHERE "Id" = ?1"#)
+            .bind(ferrofin_db::store::guid_to_db(alternate))
+            .bind(ferrofin_db::store::guid_to_db(primary))
+            .execute(db.writer())
+            .await
+            .expect("link");
+        // Only the ALTERNATE was watched.
+        seed_user_data(&db, user_id, alternate, true, None).await;
+
+        let ids = |items: Vec<ferrofin_db::entities::base_items::BaseItemEntity>| {
+            let mut v: Vec<Uuid> = items
+                .iter()
+                .filter_map(|i| Uuid::parse_str(&i.id).ok())
+                .collect();
+            v.sort();
+            v
+        };
+        let played = repository
+            .get_item_list(&InternalItemsQuery {
+                user: Some(user.clone()),
+                include_item_types: vec![BaseItemKind::Movie],
+                is_played: Some(true),
+                ..Default::default()
+            })
+            .await
+            .expect("played");
+        assert_eq!(
+            ids(played),
+            vec![primary],
+            "the primary is played through its version"
+        );
+        let unplayed = repository
+            .get_item_list(&InternalItemsQuery {
+                user: Some(user.clone()),
+                include_item_types: vec![BaseItemKind::Movie],
+                is_played: Some(false),
+                ..Default::default()
+            })
+            .await
+            .expect("unplayed");
+        assert_eq!(ids(unplayed), vec![other]);
+    }
 }
