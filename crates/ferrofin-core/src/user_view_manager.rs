@@ -30,8 +30,9 @@ use ferrofin_model::dto::SortOrder;
 use ferrofin_model::live_tv::ItemSortBy;
 use uuid::Uuid;
 
+use ferrofin_db::entities::users::UserEntity;
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::library::{UserViewManager, VirtualFolderManager};
+use ferrofin_traits::library::{UserManager, UserViewManager, VirtualFolderManager};
 use ferrofin_traits::options::{
     DtoOptions, InternalItemsQuery, LATEST_ITEMS_FALLBACK_LIMIT, LatestItemsQuery,
 };
@@ -149,6 +150,11 @@ pub struct FerrofinUserViewManager {
     /// `views/livetv`. Set by the composition root; `None` in unit tests keeps
     /// the manager from provisioning the view.
     metadata_path: Option<PathBuf>,
+    /// The user manager — needed to load the [`UserEntity`] whose visibility
+    /// rules decide whether a playlists/boxsets library has a visible child
+    /// (12.1 `UserViewManager.HasVisibleChild`). Without it (unit tests) the
+    /// check is skipped and such views are always listed.
+    users: Option<Arc<dyn UserManager>>,
 }
 
 impl std::fmt::Debug for FerrofinUserViewManager {
@@ -175,6 +181,7 @@ impl FerrofinUserViewManager {
             id_derivation: item_type_lookup::IdDerivation::LegacyLowercase,
             virtual_folders: None,
             db: None,
+            users: None,
             metadata_path: None,
         }
     }
@@ -184,6 +191,13 @@ impl FerrofinUserViewManager {
     #[must_use]
     pub fn with_metadata_path(mut self, metadata_path: impl Into<PathBuf>) -> Self {
         self.metadata_path = Some(metadata_path.into());
+        self
+    }
+
+    /// Wires the user manager (see the `users` field).
+    #[must_use]
+    pub fn with_users(mut self, users: Arc<dyn UserManager>) -> Self {
+        self.users = Some(users);
         self
     }
 
@@ -437,6 +451,93 @@ impl FerrofinUserViewManager {
             .collect()
     }
 
+    /// 12.1 `UserViewManager.GetUserViews` (`UserViewManager.cs:60-64`): a
+    /// playlists or boxsets library "only references linked items", so its
+    /// view is listed only when [`Self::has_visible_child`] holds — an
+    /// account with no playlist it may see has no Playlists view at all.
+    /// Skipped when no user manager is wired.
+    async fn without_childless_linked_libraries(
+        &self,
+        user_id: Uuid,
+        views: Vec<BaseItemEntity>,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let Some(user) = self.user_entity(user_id).await? else {
+            return Ok(views);
+        };
+        let collection_types = self.collection_types_by_id().await?;
+        let user_view = item_type_lookup::stored_type_name(BaseItemKind::UserView);
+        let mut kept = Vec::with_capacity(views.len());
+        for row in views {
+            let Ok(id) = Uuid::parse_str(&row.id) else {
+                continue;
+            };
+            let linked_folder = if Some(row.type_.as_str()) == user_view {
+                let data = crate::item_data::parse_data(row.data.as_deref());
+                if data.get("ViewType").and_then(serde_json::Value::as_str) == Some("playlists") {
+                    data.get("DisplayParentId")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|p| Uuid::parse_str(p).ok())
+                } else {
+                    None
+                }
+            } else {
+                matches!(
+                    collection_types.get(&id),
+                    Some(Some(CollectionType::playlists | CollectionType::boxsets))
+                )
+                .then_some(id)
+            };
+            if let Some(folder) = linked_folder
+                && !self.has_visible_child(folder, &user).await?
+            {
+                continue;
+            }
+            kept.push(row);
+        }
+        Ok(kept)
+    }
+
+    /// 12.1 `UserViewManager.HasVisibleChild`: whether any direct child of
+    /// the folder — or of its physical folders, for a `CollectionFolder` that
+    /// has some — is visible to `user`. One key lookup per parent, ungrouped,
+    /// stored columns only.
+    async fn has_visible_child(
+        &self,
+        folder: Uuid,
+        user: &UserEntity,
+    ) -> Result<bool, ServiceError> {
+        let mut parents = vec![folder];
+        if let Some(db) = &self.db {
+            let physical = crate::item_repository::physical_folders_by_view(db, &[folder])
+                .await?
+                .remove(&folder)
+                .unwrap_or_default();
+            if !physical.is_empty() {
+                parents = physical;
+            }
+        }
+        for parent in parents {
+            let query = InternalItemsQuery {
+                parent_id: parent,
+                user: Some(user.clone()),
+                group_by_presentation_unique_key: false,
+                limit: Some(1),
+                ..Default::default()
+            };
+            if !self.items.get_item_list(&query).await?.is_empty() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn user_entity(&self, user_id: Uuid) -> Result<Option<UserEntity>, ServiceError> {
+        match &self.users {
+            Some(users) => users.get_user_by_id(user_id).await,
+            None => Ok(None),
+        }
+    }
+
     /// Materialises the user's playlists view when a playlists folder exists
     /// and the canonical row does not — the `isNew` branch of `GetNamedView`
     /// (LibraryManager.cs:3054-3075): `Path = {InternalMetadataPath}/views/{id
@@ -458,6 +559,7 @@ impl FerrofinUserViewManager {
                 ..Default::default()
             })
             .await?;
+        let user = self.user_entity(user_id).await?;
         for folder in folders {
             let Ok(parent) = Uuid::parse_str(&folder.id) else {
                 continue;
@@ -466,6 +568,13 @@ impl FerrofinUserViewManager {
                 continue;
             };
             if persistence.item_exists(id).await? {
+                continue;
+            }
+            // 12.1: the folder is skipped before `GetNamedView`, so a user
+            // with nothing to see in it never gets the view row either.
+            if let Some(user) = &user
+                && !self.has_visible_child(parent, user).await?
+            {
                 continue;
             }
             let view_path = metadata_path.join("views").join(id.simple().to_string());
@@ -640,6 +749,9 @@ impl UserViewManager for FerrofinUserViewManager {
         };
         let views = self.items.get_item_list(&query).await?;
         let views = self.only_canonical_user_views(user_id, views);
+        let views = self
+            .without_childless_linked_libraries(user_id, views)
+            .await?;
         self.without_disabled_live_tv(user_id, views).await
     }
 
@@ -1321,6 +1433,60 @@ mod tests {
             .map(|v| (Uuid::parse_str(&v.id).expect("id"), v.name))
             .collect();
         assert_eq!(after, vec![(canonical, Some("Playlists".to_owned()))]);
+    }
+
+    /// 12.1 `HasVisibleChild`: a playlists folder with nothing the user can
+    /// see is not listed and gets no derived view; the moment it has a visible
+    /// child the view appears. The owner's library is the real case — every
+    /// playlist there sits under a music album, none under the folder — and
+    /// Jellyfin 12.1 answers `/Users/{id}/Views` without `Playlists` for it.
+    #[tokio::test]
+    async fn a_playlists_folder_without_a_visible_child_has_no_view() {
+        let db = test_db().await;
+        let user_id = Uuid::from_u128(0x5301);
+        seed_user(&db, user_id).await;
+        let folder = Uuid::from_u128(0x5302);
+        seed_named_item(
+            &db,
+            folder,
+            BaseItemKind::ManualPlaylistsFolder,
+            "Playlists",
+        )
+        .await;
+        let mode = item_type_lookup::IdDerivation::Jellyfin {
+            program_data_path: Some("/config".to_owned()),
+        };
+        let users: Arc<dyn UserManager> =
+            Arc::new(crate::user_manager::FerrofinUserManager::new(db.clone()));
+        let persistence: Arc<dyn ItemPersistenceService> = Arc::new(
+            crate::item_persistence_service::FerrofinItemPersistenceService::new(db.clone()),
+        );
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manager = manager(&db)
+            .with_database(db.clone())
+            .with_item_store(persistence)
+            .with_metadata_path(tmp.path())
+            .with_id_derivation(mode)
+            .with_users(users);
+
+        let names = |views: Vec<BaseItemEntity>| {
+            views.into_iter().filter_map(|v| v.name).collect::<Vec<_>>()
+        };
+        assert!(
+            !names(manager.get_user_views(user_id).await.expect("views"))
+                .contains(&"Playlists".to_owned()),
+            "no visible child: no Playlists view"
+        );
+
+        // A playlist the user may see, directly under the folder.
+        let playlist = Uuid::from_u128(0x5303);
+        crate::test_support::seed_child_item(&db, playlist, BaseItemKind::Playlist, "Mine", folder)
+            .await;
+        assert!(
+            names(manager.get_user_views(user_id).await.expect("views"))
+                .contains(&"Playlists".to_owned()),
+            "a visible child lists the view"
+        );
     }
 
     fn manager(db: &Database) -> FerrofinUserViewManager {

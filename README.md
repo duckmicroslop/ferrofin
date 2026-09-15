@@ -148,7 +148,7 @@ Configuration is via CLI flags, `FERROFIN_*` environment variables, or
 ## Migrating from Jellyfin
 
 Ferrofin reads Jellyfin's database directly. Point it at a data directory containing a
-Jellyfin **10.11.8–10.11.11** or **12.0** `jellyfin.db` and on first boot it detects the database,
+Jellyfin **10.11.8–10.11.11**, **12.0** or **12.1** `jellyfin.db` and on first boot it detects the database,
 validates its migration set (and refuses loudly rather than half-adopting an unexpected version), and
 adopts it in place: **no re-scan, no re-import**. Users, watch state, playlists, and Live TV
 configuration carry forward. Ferrofin retains the `Users.NormalizedUsername` column and

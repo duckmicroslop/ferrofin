@@ -290,6 +290,7 @@ async fn consolidate(
 
     move_ancestors(tx, &canonical_db, &stale_ids).await?;
     move_user_settings(tx, canonical, source_id.as_deref(), &stale_ids).await?;
+    move_remaining_references(tx, &canonical_db, &stale_ids).await?;
 
     // Nothing points at them any more, and BaseItems cascades on ParentId, so
     // this has to come last.
@@ -308,6 +309,34 @@ async fn consolidate(
         "moved items and dropped stale views in favour of the canonical view"
     );
     Ok(stale_ids.len() as u64)
+}
+
+/// 12.1's `MoveRemainingReferencesAsync`: items owned by a stale view are
+/// re-owned by the canonical one, and `LinkedChildren` rows naming a stale
+/// view on either side are dropped — keyed by `(ParentId, SortOrder)`, they
+/// cannot be re-pointed without risking a collision, and a view listing
+/// linked children is meaningless anyway.
+async fn move_remaining_references(
+    tx: &mut sqlx::SqliteConnection,
+    canonical_db: &str,
+    stale_ids: &[String],
+) -> Result<(), ServiceError> {
+    let marks = placeholders(stale_ids.len());
+    let reown_sql = format!(r#"UPDATE "BaseItems" SET "OwnerId" = ? WHERE "OwnerId" IN ({marks})"#);
+    let mut reown = sqlx::query(&reown_sql).bind(canonical_db);
+    for id in stale_ids {
+        reown = reown.bind(id);
+    }
+    reown.execute(&mut *tx).await.map_err(db_err)?;
+    let unlink_sql = format!(
+        r#"DELETE FROM "LinkedChildren" WHERE "ParentId" IN ({marks}) OR "ChildId" IN ({marks})"#
+    );
+    let mut unlink = sqlx::query(&unlink_sql);
+    for id in stale_ids.iter().chain(stale_ids) {
+        unlink = unlink.bind(id);
+    }
+    unlink.execute(&mut *tx).await.map_err(db_err)?;
+    Ok(())
 }
 
 /// `PickSourceAsync`: the stale view with the most **direct** children

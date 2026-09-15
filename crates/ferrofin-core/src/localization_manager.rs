@@ -45,6 +45,15 @@ const DEFAULT_METADATA_COUNTRY_CODE: &str = "US";
 /// Values that mean "no rating" and resolve to `None` (C# `_unratedValues`).
 const UNRATED_VALUES: &[&str] = &["n/a", "unrated", "not rated", "nr"];
 
+/// C# `IsUnrated`: the trimmed value is one of [`UNRATED_VALUES`], ordinal
+/// ignore-case.
+fn is_unrated(rating: &str) -> bool {
+    let rating = rating.trim();
+    UNRATED_VALUES
+        .iter()
+        .any(|u| u.eq_ignore_ascii_case(rating))
+}
+
 /// Jellyfin's embedded ISO 639-2 language table (`iso6392.txt`), one language per line,
 /// pipe-delimited `iso639-2/T | iso639-2/B | iso639-1 | English name | French name`. Ported
 /// verbatim from upstream so `GET /Localization/Cultures` yields the same ~200-language list.
@@ -480,25 +489,37 @@ impl LocalizationManager {
         self.parental_ratings.clone()
     }
 
-    /// Resolves a rating string to a score (C# `GetRatingScore`).
+    /// Resolves a rating string to a score (C# `GetRatingScore`, Jellyfin 12.1
+    /// `LocalizationManager.cs`).
     ///
-    /// Handles `/`-separated multi-values (first that resolves wins), unrated
-    /// tokens, plain numbers (optionally with a trailing `+`), a `country:rating`
-    /// prefix, and a direct lookup in the given (or default) country's table.
+    /// An unrated marker is checked on the whole value first (some contain a
+    /// `/` themselves: `n/a`), then the whole value is looked up before any
+    /// splitting, because several systems keep a `/` inside one rating
+    /// (`M/12`, `U/A 13+`, `7/i/fig`). Only a value with more than one
+    /// `/`-part falls back to the per-part lookup, where an unrated part is
+    /// skipped rather than ending the search and the first part that
+    /// resolves wins.
     #[must_use]
     pub fn get_rating_score(
         &self,
         rating: &str,
         country_code: Option<&str>,
     ) -> Option<ParentalRatingScore> {
-        if rating.is_empty() {
+        if rating.is_empty() || is_unrated(rating) {
             return None;
         }
-        rating
-            .split('/')
+        if let Some(score) = self.single_rating_score(rating, country_code) {
+            return Some(score);
+        }
+        let parts: Vec<&str> = rating.split('/').collect();
+        if parts.len() == 1 {
+            return None;
+        }
+        parts
+            .into_iter()
             .map(str::trim)
-            .filter(|r| !r.is_empty())
-            .find_map(|value| self.single_rating_score(value, country_code))
+            .filter(|part| !part.is_empty() && !is_unrated(part))
+            .find_map(|part| self.single_rating_score(part, country_code))
     }
 
     /// Resolves a single (already split) rating value — C#
@@ -509,10 +530,7 @@ impl LocalizationManager {
         country_code: Option<&str>,
     ) -> Option<ParentalRatingScore> {
         // Handle unrated content.
-        if UNRATED_VALUES
-            .iter()
-            .any(|u| u.eq_ignore_ascii_case(rating))
-        {
+        if is_unrated(rating) {
             return None;
         }
         // Convert ints directly. This may override some of the locale
@@ -535,7 +553,7 @@ impl LocalizationManager {
         // Use the rating system matching the language.
         if let Some(cc) = country_code.filter(|c| !c.is_empty()) {
             if let Some(table) = parental_ratings_for(cc) {
-                if let Some(score) = table.by_name.get(cleaned) {
+                if let Some(score) = table.by_name.get(&rating_key(cleaned)) {
                     return Some(*score);
                 }
                 // "US-PG-13" / "US:PG-13" with the country already known.
@@ -546,24 +564,26 @@ impl LocalizationManager {
                     && matches!(cleaned.as_bytes()[cc.len()], b'-' | b':')
                     && let Some(score) = cleaned
                         .get(cc.len() + 1..)
-                        .and_then(|tail| table.by_name.get(tail.trim()))
+                        .and_then(|tail| table.by_name.get(&rating_key(tail.trim())))
                 {
                     return Some(*score);
                 }
             }
         } else if let Some(table) = parental_ratings_for(&self.metadata_country_code)
-            && let Some(score) = table.by_name.get(cleaned)
+            && let Some(score) = table.by_name.get(&rating_key(cleaned))
         {
             // Fall back to the server default language for the ratings check.
             return Some(*score);
         }
 
         // If we don't find anything, check all rating systems, starting with US.
-        if let Some(score) = parental_ratings_for("us").and_then(|t| t.by_name.get(cleaned)) {
+        if let Some(score) =
+            parental_ratings_for("us").and_then(|t| t.by_name.get(&rating_key(cleaned)))
+        {
             return Some(*score);
         }
         for table in PARENTAL_RATINGS.values() {
-            if let Some(score) = table.by_name.get(cleaned) {
+            if let Some(score) = table.by_name.get(&rating_key(cleaned)) {
                 return Some(*score);
             }
         }
@@ -602,7 +622,7 @@ impl LocalizationManager {
         if let Some(cc) = resolved_country_code.as_deref()
             && let Some(table) = parental_ratings_for(cc)
         {
-            if let Some(score) = table.by_name.get(rating_part) {
+            if let Some(score) = table.by_name.get(&rating_key(rating_part)) {
                 return SeparatorLookup::Resolved(Some(*score));
             }
             // Not a recognised rating string: fall back to using the number.
@@ -726,6 +746,12 @@ fn load_culture_data() -> CultureData {
 /// (built from `ordered`) and `get_rating_score` (which reads `by_name`) reporting the
 /// same score for the same rating. The vendored data has no repeated rating string, so
 /// this branch is unreachable today and the emitted order is unchanged either way.
+/// The `by_name` key for a rating string: .NET invariant uppercase, so the
+/// table behaves like `Dictionary<…>(StringComparer.OrdinalIgnoreCase)`.
+fn rating_key(rating: &str) -> String {
+    ferrofin_util::string_extensions::upper_invariant(rating)
+}
+
 fn load_rating_table(json: &str) -> RatingTable {
     let mut ordered: Vec<(String, ParentalRatingScore)> = Vec::new();
     let mut by_name = HashMap::new();
@@ -733,7 +759,9 @@ fn load_rating_table(json: &str) -> RatingTable {
         for entry in system.ratings {
             if let Some(score) = entry.rating_score {
                 for rating in entry.rating_strings {
-                    if by_name.insert(rating.clone(), score).is_none() {
+                    // 12.1: rating strings compare case-insensitively —
+                    // providers are not consistent (`VM18` vs `vm18`).
+                    if by_name.insert(rating_key(&rating), score).is_none() {
                         ordered.push((rating, score));
                     } else if let Some(slot) = ordered.iter_mut().find(|(name, _)| name == &rating)
                     {
@@ -1245,7 +1273,7 @@ mod tests {
         assert_eq!(table.ordered.len(), table.by_name.len());
         assert_eq!(table.ordered.len(), 52);
         for (name, score) in &table.ordered {
-            assert_eq!(table.by_name.get(name), Some(score));
+            assert_eq!(table.by_name.get(&rating_key(name)), Some(score));
         }
         assert!(parental_ratings_for("zz").is_none());
     }
@@ -1372,7 +1400,7 @@ mod tests {
 
         // Last value wins, in both views.
         for (name, score) in &table.ordered {
-            assert_eq!(table.by_name.get(name), Some(score), "{name}");
+            assert_eq!(table.by_name.get(&rating_key(name)), Some(score), "{name}");
         }
         let dup = table.by_name.get("ZZ-DUP").copied().expect("ZZ-DUP");
         assert_eq!((dup.score, dup.sub_score), (18, Some(3)));

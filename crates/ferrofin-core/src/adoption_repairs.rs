@@ -16,6 +16,8 @@ use ferrofin_db::store::guid_to_db;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_traits::error::ServiceError;
 use serde_json::{Map, Value};
+use std::collections::{BTreeMap, BTreeSet};
+
 use uuid::Uuid;
 
 use crate::db_error::db_err;
@@ -61,6 +63,14 @@ pub async fn run_all(db: &Database) -> Result<(), ServiceError> {
             "backfilled alternate-version links from PrimaryVersionId"
         );
     }
+    let (repaired, promoted) = repair_alternate_version_links(db).await?;
+    if repaired + promoted > 0 {
+        tracing::info!(
+            repaired,
+            promoted,
+            "repaired alternate-version primaries from LinkedChildren"
+        );
+    }
     let artists = merge_duplicate_music_artists(db).await?;
     if artists > 0 {
         tracing::info!(items = artists, "merged case-only duplicate music artists");
@@ -68,6 +78,13 @@ pub async fn run_all(db: &Database) -> Result<(), ServiceError> {
     let people = merge_duplicate_people(db).await?;
     if people > 0 {
         tracing::info!(items = people, "merged case-only duplicate people");
+    }
+    let stripped = strip_embedded_linked_children(db).await?;
+    if stripped > 0 {
+        tracing::info!(
+            items = stripped,
+            "dropped dead LinkedChildren/ExtraIds keys from serialized item data"
+        );
     }
     Ok(())
 }
@@ -520,6 +537,227 @@ pub async fn backfill_alternate_version_links(db: &Database) -> Result<usize, Se
     Ok(written)
 }
 
+/// The port of 12.1's `RepairAlternateVersionLinks`: `LinkedChildren` rows
+/// of type Local(2)/Linked(3) are the truth about version groups, so every
+/// child's `PrimaryVersionId` and `PresentationUniqueKey` are re-derived from
+/// them. A child linked under a parent that is itself a version follows the
+/// chain to the root (a loop keeps its lowest id, .NET `Guid` order, as the
+/// primary); a self-link is skipped; a primary that still carries a
+/// `PrimaryVersionId` of its own is promoted (`PrimaryVersionId` cleared,
+/// key = its own id) unless it is owned, in which case the group stays hidden
+/// until `FixIncorrectOwnerIdRelationships` repairs the owner. Runs once per
+/// database (`FerrofinMeta`), after [`backfill_alternate_version_links`] has
+/// written Ferrofin's own groups into `LinkedChildren`.
+///
+/// Returns `(repaired children, promoted primaries)`.
+///
+/// # Errors
+/// Returns [`ServiceError`] if the underlying queries fail.
+pub async fn repair_alternate_version_links(db: &Database) -> Result<(usize, usize), ServiceError> {
+    const KEY: &str = "alternate_version_links_repaired_v121";
+    if !once(db, KEY).await? {
+        return Ok((0, 0));
+    }
+    let links: Vec<(String, String, i64)> = sqlx::query_as(
+        r#"SELECT "ParentId", "ChildId", "ChildType" FROM "LinkedChildren"
+           WHERE "ChildType" IN (2, 3) ORDER BY "ChildId", "ChildType", "ParentId""#,
+    )
+    .fetch_all(db.pool())
+    .await
+    .map_err(db_err)?;
+    // Local(2) beats Linked(3) for a child under two parents — the ORDER BY
+    // puts it first, so the first row per child wins.
+    let mut primary_by_child: BTreeMap<Uuid, Uuid> = BTreeMap::new();
+    for (parent, child, _) in &links {
+        let (Ok(parent), Ok(child)) = (Uuid::parse_str(parent), Uuid::parse_str(child)) else {
+            continue;
+        };
+        primary_by_child.entry(child).or_insert(parent);
+    }
+    for child in primary_by_child
+        .iter()
+        .filter(|(child, parent)| child == parent)
+        .map(|(child, _)| *child)
+        .collect::<Vec<_>>()
+    {
+        tracing::warn!(child_id = %child, "skipping alternate version linked to itself");
+        primary_by_child.remove(&child);
+    }
+    resolve_primaries(&mut primary_by_child);
+
+    let mut item_ids: Vec<Uuid> = primary_by_child
+        .iter()
+        .flat_map(|(child, primary)| [*child, *primary])
+        .collect();
+    item_ids.sort_unstable();
+    item_ids.dedup();
+    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    let (mut repaired, mut promoted) = (0usize, 0usize);
+    for id in item_ids {
+        let Some((primary_version_id, key, owner_id)) =
+            sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>)>(
+                r#"SELECT "PrimaryVersionId", "PresentationUniqueKey", "OwnerId"
+                   FROM "BaseItems" WHERE "Id" = ?1"#,
+            )
+            .bind(guid_to_db(id))
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?
+        else {
+            continue;
+        };
+        let stored_primary = primary_version_id
+            .as_deref()
+            .and_then(|p| Uuid::parse_str(p).ok());
+        if let Some(primary) = primary_by_child.get(&id) {
+            let expected_key = primary.as_simple().to_string();
+            if stored_primary == Some(*primary) && key.as_deref() == Some(expected_key.as_str()) {
+                continue;
+            }
+            set_primary(&mut tx, id, Some(*primary), &expected_key).await?;
+            repaired += 1;
+        } else if stored_primary.is_some() {
+            if owner_id.is_some() {
+                tracing::warn!(
+                    item_id = %id,
+                    owner_id = ?owner_id,
+                    "alternate versions are linked to an owned item; the group stays hidden until the owner is repaired"
+                );
+                continue;
+            }
+            tracing::warn!(
+                item_id = %id,
+                stale_primary = ?stored_primary,
+                "clearing the stale primary of an item other versions are linked to"
+            );
+            set_primary(&mut tx, id, None, &id.as_simple().to_string()).await?;
+            promoted += 1;
+        }
+    }
+    sqlx::query(
+        r#"INSERT INTO "FerrofinMeta" ("Key", "Value") VALUES (?1, '1')
+           ON CONFLICT("Key") DO UPDATE SET "Value" = '1'"#,
+    )
+    .bind(KEY)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    tx.commit().await.map_err(db_err)?;
+    Ok((repaired, promoted))
+}
+
+async fn set_primary(
+    tx: &mut sqlx::SqliteConnection,
+    id: Uuid,
+    primary: Option<Uuid>,
+    key: &str,
+) -> Result<(), ServiceError> {
+    sqlx::query(
+        r#"UPDATE "BaseItems" SET "PrimaryVersionId" = ?2, "PresentationUniqueKey" = ?3
+           WHERE "Id" = ?1"#,
+    )
+    .bind(guid_to_db(id))
+    .bind(primary.map(guid_to_db))
+    .bind(key)
+    .execute(tx)
+    .await
+    .map_err(db_err)?;
+    Ok(())
+}
+
+/// `RepairAlternateVersionLinks.ResolvePrimaries`: every child maps to the
+/// root of its chain; a loop keeps its smallest id (.NET `Guid` order) as the
+/// primary and drops that id's own link.
+fn resolve_primaries(primary_by_child: &mut BTreeMap<Uuid, Uuid>) {
+    let mut resolved: BTreeMap<Uuid, Uuid> = BTreeMap::new();
+    for start in primary_by_child.keys().copied().collect::<Vec<_>>() {
+        if resolved.contains_key(&start) {
+            continue;
+        }
+        let mut chain: Vec<Uuid> = Vec::new();
+        let mut walked: BTreeSet<Uuid> = BTreeSet::new();
+        let mut current = start;
+        let primary = loop {
+            if let Some(done) = resolved.get(&current) {
+                break *done;
+            }
+            let Some(next) = primary_by_child.get(&current).copied() else {
+                break current;
+            };
+            if !walked.insert(current) {
+                let at = chain.iter().position(|c| *c == current).unwrap_or(0);
+                let primary = chain[at..]
+                    .iter()
+                    .copied()
+                    .min_by(|a, b| dotnet_guid_cmp(*a, *b))
+                    .unwrap_or(current);
+                tracing::warn!(
+                    loop_ = ?chain[at..],
+                    primary_id = %primary,
+                    "alternate version links form a loop; keeping the lowest id as the primary"
+                );
+                primary_by_child.remove(&primary);
+                break primary;
+            }
+            chain.push(current);
+            current = next;
+        };
+        for version in chain {
+            resolved.insert(version, primary);
+        }
+    }
+    for (child, primary) in primary_by_child.iter_mut() {
+        if let Some(root) = resolved.get(child)
+            && root != child
+        {
+            *primary = *root;
+        }
+    }
+}
+
+/// `System.Guid.CompareTo`: the `int`, `short`, `short` fields as signed
+/// numbers, then the eight tail bytes — not the byte order of the string.
+fn dotnet_guid_cmp(a: Uuid, b: Uuid) -> std::cmp::Ordering {
+    let (a1, a2, a3, a4) = a.as_fields();
+    let (b1, b2, b3, b4) = b.as_fields();
+    (a1.cast_signed(), a2.cast_signed(), a3.cast_signed(), a4).cmp(&(
+        b1.cast_signed(),
+        b2.cast_signed(),
+        b3.cast_signed(),
+        b4,
+    ))
+}
+
+/// The port of 12.1's `StripEmbeddedLinkedChildren`: `LinkedChildren`,
+/// `ExtraIds` and `SupportsExternalTransfer` are dead keys in the serialized
+/// `Data` once `LinkedChildren` (the table) is the store, so they are removed
+/// from every item that still carries them. Runs once, and after
+/// [`import_membership_once`], which is the last reader of that JSON.
+///
+/// # Errors
+/// Returns [`ServiceError`] if the update fails.
+pub async fn strip_embedded_linked_children(db: &Database) -> Result<u64, ServiceError> {
+    const KEY: &str = "strip_embedded_linked_children_v121";
+    if !once(db, KEY).await? {
+        return Ok(0);
+    }
+    let updated = sqlx::query(
+        r#"UPDATE "BaseItems"
+           SET "Data" = json_remove("Data", '$.LinkedChildren', '$.ExtraIds', '$.SupportsExternalTransfer')
+           WHERE "Data" IS NOT NULL
+             AND json_valid("Data") = 1
+             AND ("Data" LIKE '%"LinkedChildren"%'
+               OR "Data" LIKE '%"ExtraIds"%'
+               OR "Data" LIKE '%"SupportsExternalTransfer"%')"#,
+    )
+    .execute(db.writer())
+    .await
+    .map_err(db_err)?
+    .rows_affected();
+    done(db, KEY).await?;
+    Ok(updated)
+}
+
 /// `MergeDuplicateMusicArtists` (12.0): `MusicArtist` rows whose names differ
 /// only by case are folded onto one keeper — the one with the most direct
 /// children, then ancestor rows, then links, then the oldest — and every
@@ -895,6 +1133,163 @@ mod tests {
             .expect("empty");
         assert_eq!(import_membership_once(&db).await.expect("again"), 0);
         assert!(links(&db).await.is_empty());
+    }
+
+    async fn link(db: &Database, parent: Uuid, child: Uuid, child_type: i64, order: i64) {
+        sqlx::query(
+            r#"INSERT INTO "LinkedChildren" ("ParentId", "SortOrder", "ChildId", "ChildType")
+               VALUES (?1, ?2, ?3, ?4)"#,
+        )
+        .bind(guid_to_db(parent))
+        .bind(order)
+        .bind(guid_to_db(child))
+        .bind(child_type)
+        .execute(db.writer())
+        .await
+        .expect("link");
+    }
+
+    async fn primary_and_key(db: &Database, id: Uuid) -> (Option<String>, Option<String>) {
+        sqlx::query_as(
+            r#"SELECT "PrimaryVersionId", "PresentationUniqueKey" FROM "BaseItems" WHERE "Id" = ?1"#,
+        )
+        .bind(guid_to_db(id))
+        .fetch_one(db.pool())
+        .await
+        .expect("row")
+    }
+
+    /// 12.1 `RepairAlternateVersionLinks`: children take their primary from
+    /// `LinkedChildren` (chains resolve to the root, Local beats Linked), a
+    /// self-link is ignored, a loop keeps its lowest id, a primary that is
+    /// itself marked as a version is promoted unless it is owned — and the
+    /// pass runs once.
+    #[tokio::test]
+    #[allow(clippy::many_single_char_names)] // the upstream test's own letters
+    async fn alternate_version_links_repair_matches_12_1() {
+        let db = test_db().await;
+        let ids: Vec<Uuid> = (0x31..=0x3A).map(Uuid::from_u128).collect();
+        let [p, a, b, c, d, e, q, r, owner, s] = ids[..] else {
+            unreachable!()
+        };
+        for id in &ids {
+            seed_item(&db, *id, BaseItemKind::Movie).await;
+        }
+        // p ← a (Local) ← b (Linked): b resolves to p through a.
+        link(&db, p, a, LOCAL_ALTERNATE_VERSION, 0).await;
+        link(&db, a, b, LINKED_ALTERNATE_VERSION, 0).await;
+        // c links to itself: ignored.
+        link(&db, c, c, LOCAL_ALTERNATE_VERSION, 0).await;
+        // d ↔ e loop: the lower id (d) is the primary.
+        link(&db, d, e, LINKED_ALTERNATE_VERSION, 0).await;
+        link(&db, e, d, LINKED_ALTERNATE_VERSION, 0).await;
+        // q is a primary (s links under it) but still carries a stale
+        // PrimaryVersionId of its own: promoted. r is the same (owner links
+        // under it) but owned: left alone.
+        link(&db, q, s, LOCAL_ALTERNATE_VERSION, 0).await;
+        for (id, stale) in [(q, c), (r, c)] {
+            sqlx::query(r#"UPDATE "BaseItems" SET "PrimaryVersionId" = ?2 WHERE "Id" = ?1"#)
+                .bind(guid_to_db(id))
+                .bind(guid_to_db(stale))
+                .execute(db.writer())
+                .await
+                .expect("stale primary");
+        }
+        sqlx::query(r#"UPDATE "BaseItems" SET "OwnerId" = ?2 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(r))
+            .bind(guid_to_db(owner))
+            .execute(db.writer())
+            .await
+            .expect("owner");
+        link(&db, r, owner, LOCAL_ALTERNATE_VERSION, 1).await;
+
+        let (repaired, promoted) = repair_alternate_version_links(&db).await.expect("repair");
+        let key = |id: Uuid| id.as_simple().to_string();
+        assert_eq!(
+            primary_and_key(&db, a).await,
+            (Some(guid_to_db(p)), Some(key(p)))
+        );
+        assert_eq!(
+            primary_and_key(&db, b).await,
+            (Some(guid_to_db(p)), Some(key(p))),
+            "b resolves through a to p"
+        );
+        assert_eq!(primary_and_key(&db, c).await.0, None, "self-link ignored");
+        assert_eq!(
+            primary_and_key(&db, e).await,
+            (Some(guid_to_db(d)), Some(key(d))),
+            "loop keeps the lowest id"
+        );
+        assert_eq!(primary_and_key(&db, d).await.0, None);
+        assert_eq!(
+            primary_and_key(&db, q).await,
+            (None, Some(key(q))),
+            "a primary marked as a version is promoted"
+        );
+        assert_eq!(
+            primary_and_key(&db, r).await.0,
+            Some(guid_to_db(c)),
+            "an owned primary is left for the owner repair"
+        );
+        // a, b, e, s and r's child (owner) repaired; q promoted.
+        assert_eq!((repaired, promoted), (5, 1));
+        assert_eq!(
+            repair_alternate_version_links(&db).await.expect("again"),
+            (0, 0)
+        );
+    }
+
+    /// `Guid.CompareTo` orders by the signed int/short/short fields first.
+    #[test]
+    fn dotnet_guid_order_is_by_field_not_by_string() {
+        let low = Uuid::parse_str("7fffffff-0000-0000-0000-000000000000").expect("uuid");
+        let high = Uuid::parse_str("80000000-0000-0000-0000-000000000000").expect("uuid");
+        // 0x80000000 is negative as an int, so .NET sorts it first.
+        assert_eq!(dotnet_guid_cmp(high, low), std::cmp::Ordering::Less);
+        assert_eq!(dotnet_guid_cmp(low, low), std::cmp::Ordering::Equal);
+    }
+
+    /// 12.1 `StripEmbeddedLinkedChildren`: the three dead keys go, everything
+    /// else in the blob stays, invalid JSON is untouched, and the pass runs once.
+    #[tokio::test]
+    async fn embedded_linked_children_keys_are_stripped_once() {
+        let db = test_db().await;
+        let (a, b, c) = (
+            Uuid::from_u128(0x21),
+            Uuid::from_u128(0x22),
+            Uuid::from_u128(0x23),
+        );
+        seed_named_item(&db, a, BaseItemKind::Playlist, "P").await;
+        seed_named_item(&db, b, BaseItemKind::Movie, "M").await;
+        seed_named_item(&db, c, BaseItemKind::Movie, "N").await;
+        set_data(
+            &db,
+            a,
+            r#"{"OpenAccess":true,"LinkedChildren":[{"Type":"Manual"}],"ExtraIds":["x"],"SupportsExternalTransfer":false}"#,
+        )
+        .await;
+        set_data(&db, b, r#"{"Overview":"kept"}"#).await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "Data" = '{not json' WHERE "Id" = ?1"#)
+            .bind(guid_to_db(c))
+            .execute(db.writer())
+            .await
+            .expect("bad json");
+
+        assert_eq!(strip_embedded_linked_children(&db).await.expect("strip"), 1);
+        let data = |id: Uuid| {
+            let db = db.clone();
+            async move {
+                sqlx::query_scalar::<_, String>(r#"SELECT "Data" FROM "BaseItems" WHERE "Id" = ?1"#)
+                    .bind(guid_to_db(id))
+                    .fetch_one(db.pool())
+                    .await
+                    .expect("data")
+            }
+        };
+        assert_eq!(data(a).await, r#"{"OpenAccess":true}"#);
+        assert_eq!(data(b).await, r#"{"Overview":"kept"}"#);
+        assert_eq!(data(c).await, "{not json");
+        assert_eq!(strip_embedded_linked_children(&db).await.expect("again"), 0);
     }
 
     /// The JSON on a 12.0 database is frozen: an emptied playlist must stay

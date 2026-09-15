@@ -909,7 +909,10 @@ impl FerrofinItemPersistenceService {
         &self,
         localization: &dyn ferrofin_traits::localization::LocalizationManager,
     ) -> Result<u64, ServiceError> {
-        const META_KEY: &str = "rating_levels_v12";
+        // 12.1 re-dated `MigrateRatingLevels` (its `GetRatingScore` changed:
+        // whole-value lookup first, unrated parts skipped, case-insensitive
+        // tables), so the pass runs once more under a new key.
+        const META_KEY: &str = "rating_levels_v121";
         if self.repair_done(META_KEY).await? {
             return Ok(0);
         }

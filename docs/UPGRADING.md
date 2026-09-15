@@ -31,9 +31,16 @@ Behaviour that changed with the shape:
 - Localized user views (e.g. a Live TV view created under a translated name) are
   consolidated onto their name-independent id once, with channels, ancestors and
   display preferences moved along.
-- **Adopting a Jellyfin database** now accepts 12.0.0 as well as 10.11.8–10.11.11 (exact
-  migration sets, still one-way; a 12.0 database baselines `0030` and `0032`, whose shape it
-  already has). A 12.0 database keeps its `LinkedChildren` rows and
+- **Adopting a Jellyfin database** now accepts 12.0.0 and 12.1.0 as well as 10.11.8–10.11.11
+  (exact migration sets, still one-way; a 12.x database baselines `0030` and `0032`, whose
+  shape it already has).
+- A **Playlists** (or Collections) view is listed only when the user can see something in it,
+  as in Jellyfin 12.1. A library whose playlists all live inside music album folders — every
+  `.m3u` next to an album — has no Playlists view on the home screen; the playlists themselves
+  are unchanged and still found by search and `/Items`.
+- Alternate-version groups are re-derived once from `LinkedChildren` (Jellyfin 12.1's
+  `RepairAlternateVersionLinks`): an item marked as a version of a row that no longer exists
+  becomes a primary again and reappears in listings. A 12.0 database keeps its `LinkedChildren` rows and
   is never re-imported from the frozen JSON copy in `Data`.
 
 ## Unreleased — Unicode username matching

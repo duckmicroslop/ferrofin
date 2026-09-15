@@ -897,6 +897,9 @@ pub async fn build_app_state(
             .with_metadata_path(paths.internal_metadata_path())
             .with_id_derivation(id_derivation.clone())
             .with_virtual_folders(Arc::clone(&virtual_folders))
+            // 12.1 lists a playlists/boxsets view only when the user can see
+            // a child in it, which needs the user's own visibility rules.
+            .with_users(Arc::clone(&users))
             .with_database(db.clone()),
     );
 

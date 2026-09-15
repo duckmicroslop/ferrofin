@@ -1023,6 +1023,20 @@ const JELLYFIN_10_11_X_ADDITIVE_MIGRATIONS: [&str; 3] = [
     "20260524120336_AddUniqueNormalizedUsernameIndex",
 ];
 
+/// The three code-migration ids Jellyfin 12.1 adds on top of
+/// [`JELLYFIN_12_0_MIGRATIONS`] (no EF schema migration: the 12.1 schema is
+/// 12.0's byte for byte). Captured from `jellyfin/jellyfin:12.1` booted on
+/// the 10.11.8 fixture (104 ids) and on the 12.0 fixture (105 ids).
+const JELLYFIN_12_1_ADDITIVE_MIGRATIONS: [&str; 3] = [
+    "20260908120000_RepairAlternateVersionLinks",
+    "20260910120000_MigrateRatingLevels",
+    "20260911120000_StripEmbeddedLinkedChildren",
+];
+
+/// 12.1 re-dated `MigrateRatingLevels`, so a database upgraded 12.0 → 12.1
+/// carries this id and one that went 10.11 → 12.1 never sees it.
+const JELLYFIN_12_0_RATING_LEVELS_MIGRATION: [&str; 1] = ["20260302090000_MigrateRatingLevels"];
+
 /// A Jellyfin schema generation Ferrofin adopts in place.
 ///
 /// Adoption is gated on the **exact** `__EFMigrationsHistory` id set a real
@@ -1032,13 +1046,17 @@ const JELLYFIN_10_11_X_ADDITIVE_MIGRATIONS: [&str; 3] = [
 /// without executing; every other migration runs.
 #[derive(Debug, Clone, Copy)]
 pub struct JellyfinGeneration {
-    /// The release name, as shown in logs and errors (`"10.11.8"`, `"10.11.11"`, `"12.0.0"`).
+    /// The release name, as shown in logs and errors (`"10.11.8"`, `"10.11.11"`,
+    /// `"12.0.0"`, `"12.1.0"`).
     pub name: &'static str,
     /// The EF migration-id set of that release (with [`Self::additional_ids`]).
     pub migration_ids: &'static [&'static str],
     /// Ids a point release added on top of `migration_ids` (10.11.10/11 over
-    /// 10.11.8); empty for a release captured whole.
+    /// 10.11.8, 12.1 over 12.0); empty for a release captured whole.
     pub additional_ids: &'static [&'static str],
+    /// Ids that may or may not be present (a routine a later release re-dated:
+    /// an upgraded install still records the old id, a fresh one never does).
+    pub optional_ids: &'static [&'static str],
     /// Ferrofin migrations baselined (recorded, never run) for that generation.
     pub baselined_versions: &'static [i64],
 }
@@ -1046,48 +1064,68 @@ pub struct JellyfinGeneration {
 /// The generations Ferrofin adopts. `0001`–`0007` are the 10.11.8 shape every
 /// generation already has; `0030` (the `NormalizedUsername` column and index)
 /// is baselined wherever the database already owns it, `0032` (the 12.0
-/// shape) only for 12.0. `0031`, `0033` and `0034` are never baselined: they
-/// are data-only or Ferrofin-side convergence and must run on every path.
-pub const JELLYFIN_GENERATIONS: [JellyfinGeneration; 3] = [
+/// shape) for 12.0 and 12.1. `0031`, `0033` and `0034` are never baselined:
+/// they are data-only or Ferrofin-side convergence and must run on every path.
+pub const JELLYFIN_GENERATIONS: [JellyfinGeneration; 4] = [
     JellyfinGeneration {
         name: "10.11.8",
         migration_ids: &JELLYFIN_10_11_8_MIGRATIONS,
         additional_ids: &[],
+        optional_ids: &[],
         baselined_versions: &[1, 2, 3, 4, 5, 6, 7],
     },
     JellyfinGeneration {
         name: "10.11.11",
         migration_ids: &JELLYFIN_10_11_8_MIGRATIONS,
         additional_ids: &JELLYFIN_10_11_X_ADDITIVE_MIGRATIONS,
+        optional_ids: &[],
         baselined_versions: &[1, 2, 3, 4, 5, 6, 7, 30],
     },
     JellyfinGeneration {
         name: "12.0.0",
         migration_ids: &JELLYFIN_12_0_MIGRATIONS,
         additional_ids: &[],
+        optional_ids: &[],
+        baselined_versions: &[1, 2, 3, 4, 5, 6, 7, 30, 32],
+    },
+    JellyfinGeneration {
+        name: "12.1.0",
+        migration_ids: &JELLYFIN_12_0_MIGRATIONS,
+        additional_ids: &JELLYFIN_12_1_ADDITIVE_MIGRATIONS,
+        optional_ids: &JELLYFIN_12_0_RATING_LEVELS_MIGRATION,
         baselined_versions: &[1, 2, 3, 4, 5, 6, 7, 30, 32],
     },
 ];
 
 impl JellyfinGeneration {
-    /// The complete, sorted id set of the release.
+    /// The sorted id set a database of this release must carry — everything
+    /// but the optional ids.
     fn ids(&self) -> Vec<&'static str> {
         let mut ids: Vec<&str> = self
             .migration_ids
             .iter()
             .chain(self.additional_ids)
+            .filter(|id| !self.optional_ids.contains(id))
             .copied()
             .collect();
         ids.sort_unstable();
         ids
     }
+
+    /// Whether `applied` (sorted) is this release: exactly [`Self::ids`] once
+    /// the optional ids are set aside.
+    fn matches(&self, applied: &[String]) -> bool {
+        applied
+            .iter()
+            .map(String::as_str)
+            .filter(|a| !self.optional_ids.contains(a))
+            .eq(self.ids())
+    }
 }
 
 /// The generation whose id set equals `applied` (sorted), if any.
 fn match_generation(applied: &[String]) -> Option<&'static JellyfinGeneration> {
-    JELLYFIN_GENERATIONS
-        .iter()
-        .find(|g| applied.iter().map(String::as_str).eq(g.ids()))
+    JELLYFIN_GENERATIONS.iter().find(|g| g.matches(applied))
 }
 
 /// The refusal for an EF history that matches no generation, reported against
@@ -1105,7 +1143,7 @@ fn unsupported_generation(applied: &[String]) -> crate::DbError {
                 .collect();
             let extra: Vec<&str> = applied
                 .iter()
-                .filter(|a| !ids.contains(&a.as_str()))
+                .filter(|a| !ids.contains(&a.as_str()) && !g.optional_ids.contains(&a.as_str()))
                 .map(String::as_str)
                 .collect();
             (g, missing, extra)
@@ -1132,7 +1170,7 @@ fn unsupported_generation(applied: &[String]) -> crate::DbError {
 /// Ferrofin-native database or one adopted before this bookkeeping existed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdoptionState {
-    /// The generation name (`"10.11.8"` / `"12.0.0"`).
+    /// The generation name (`"10.11.8"`, `"10.11.11"`, `"12.0.0"`, `"12.1.0"`).
     pub generation: String,
     /// Whether the playlist/collection membership import from `Data` JSON has run.
     pub membership_import_done: bool,
@@ -2327,6 +2365,7 @@ mod tests {
                 .expect("generation")
         };
         assert!(by_name("12.0.0").baselined_versions.contains(&32));
+        assert!(by_name("12.1.0").baselined_versions.contains(&32));
         assert!(!by_name("10.11.8").baselined_versions.contains(&32));
         assert!(!by_name("10.11.11").baselined_versions.contains(&32));
         // `0030` is baselined exactly where Jellyfin already owns the column.
@@ -2659,6 +2698,80 @@ mod tests {
             "unexpected error: {err}"
         );
         assert!(err.to_string().contains("SomethingFromTheFuture"));
+        assert!(!path.with_extension("db.pre-ferrofin").exists());
+    }
+
+    /// 12.1 adds three code-migration ids and re-dates `MigrateRatingLevels`:
+    /// an install upgraded 12.0 → 12.1 keeps the old id (105 ids), one that
+    /// went 10.11 → 12.1 never had it (104). Both are the 12.1 generation; a
+    /// 12.0 set with only some of the three is neither.
+    #[rstest::rstest]
+    #[case(true, 105)]
+    #[case(false, 104)]
+    #[tokio::test]
+    async fn adopts_a_jellyfin_12_1_database_on_either_upgrade_route(
+        #[case] upgraded_from_12_0: bool,
+        #[case] expected_rows: usize,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        let mut ids: Vec<&str> = JELLYFIN_12_0_MIGRATIONS
+            .iter()
+            .copied()
+            .filter(|id| upgraded_from_12_0 || !JELLYFIN_12_0_RATING_LEVELS_MIGRATION.contains(id))
+            .chain(JELLYFIN_12_1_ADDITIVE_MIGRATIONS)
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids.len(), expected_rows);
+        seed_jellyfin_fixture_with(&path, SCHEMA_12_0, &ids).await;
+
+        let url = format!("sqlite://{}", path.display());
+        let db = Database::connect_sized(&url, Some(2))
+            .await
+            .expect("12.1 adoption succeeds");
+        assert_eq!(
+            db.adoption_state()
+                .await
+                .expect("state")
+                .map(|s| s.generation),
+            Some("12.1.0".to_owned())
+        );
+        let versions = recorded_versions(&db).await;
+        assert!(
+            versions.contains(&32),
+            "0032 baselined: the shape is 12.0's"
+        );
+        assert!(
+            versions.contains(&30),
+            "0030 baselined: NormalizedUsername exists"
+        );
+        assert!(
+            !path.with_extension("db.pre-0032").exists(),
+            "no rebuild ran"
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_a_12_0_set_with_only_part_of_12_1() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        // Two of the three 12.1 ids: closer to 12.1 (one missing) than to
+        // 12.0 (two unknown), and refused either way.
+        let mut ids: Vec<&str> = JELLYFIN_12_0_MIGRATIONS.to_vec();
+        ids.extend(&JELLYFIN_12_1_ADDITIVE_MIGRATIONS[..2]);
+        ids.sort_unstable();
+        seed_jellyfin_fixture_with(&path, SCHEMA_12_0, &ids).await;
+
+        let url = format!("sqlite://{}", path.display());
+        let err = Database::connect_sized(&url, Some(2))
+            .await
+            .expect_err("a partial 12.1 history is refused");
+        let text = err.to_string();
+        assert!(text.contains("closest is 12.1.0"), "{text}");
+        assert!(
+            text.contains("20260911120000_StripEmbeddedLinkedChildren"),
+            "{text}"
+        );
         assert!(!path.with_extension("db.pre-ferrofin").exists());
     }
 
