@@ -464,15 +464,20 @@ impl FerrofinUserViewManager {
         let Some(user) = self.user_entity(user_id).await? else {
             return Ok(views);
         };
-        let collection_types = self.collection_types_by_id().await?;
         let user_view = item_type_lookup::stored_type_name(BaseItemKind::UserView);
         let mut kept = Vec::with_capacity(views.len());
         for row in views {
             let Ok(id) = Uuid::parse_str(&row.id) else {
                 continue;
             };
+            // Both kinds of row say what they are in `Data`: a derived view
+            // carries `ViewType` + `DisplayParentId`, a `CollectionFolder`
+            // carries `CollectionType` (Jellyfin's rows and Ferrofin's own).
+            // Reading it here keeps this off the virtual-folder listing, which
+            // walks the library root and every options file per call — that
+            // cost doubled `/Users/{id}/Views` on the bench when tried.
+            let data = crate::item_data::parse_data(row.data.as_deref());
             let linked_folder = if Some(row.type_.as_str()) == user_view {
-                let data = crate::item_data::parse_data(row.data.as_deref());
                 if data.get("ViewType").and_then(serde_json::Value::as_str) == Some("playlists") {
                     data.get("DisplayParentId")
                         .and_then(serde_json::Value::as_str)
@@ -482,8 +487,9 @@ impl FerrofinUserViewManager {
                 }
             } else {
                 matches!(
-                    collection_types.get(&id),
-                    Some(Some(CollectionType::playlists | CollectionType::boxsets))
+                    data.get("CollectionType")
+                        .and_then(serde_json::Value::as_str),
+                    Some("playlists" | "boxsets")
                 )
                 .then_some(id)
             };
