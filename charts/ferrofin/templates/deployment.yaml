@@ -38,6 +38,10 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
+      {{- if .Values.hostNetwork }}
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- end }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -63,6 +67,11 @@ spec:
             - name: http
               containerPort: {{ .Values.service.port }}
               protocol: TCP
+            {{- if .Values.discovery.enabled }}
+            - name: discovery
+              containerPort: 7359
+              protocol: UDP
+            {{- end }}
           {{- with .Values.ferrofin.env }}
           env:
             {{- toYaml . | nindent 12 }}

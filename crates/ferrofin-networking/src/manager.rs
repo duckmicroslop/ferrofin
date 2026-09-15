@@ -1,18 +1,10 @@
 //! Port of `Jellyfin.Networking.Manager.NetworkManager` — the bind-address /
 //! published-URL resolver.
 //!
-//! The deterministic settings pipeline (`UpdateSettings` → `InitializeLan` /
-//! `InitializeRemote` / `InitializeOverrides` / `EnforceBindSettings`) and the
-//! read-side queries (`get_bind_address`, `is_in_local_network`,
-//! `should_allow_server_access`, `get_internal_bind_addresses`,
-//! `get_all_bind_interfaces`, `get_loopbacks`, `try_parse_interface`,
-//! `is_link_local_address`) are ported. Deferred (per the port charter): OS
-//! `NetworkChange` event wiring, the `Thread.Sleep(2000)` debounce, `Dispose`,
-//! live `GetInterfacesCore` enumeration, and the `HttpRequest` overload.
-//!
-//! Live interface enumeration is deferred: when no mock interface string is
-//! supplied the interface list starts empty (callers on a real host will inject
-//! interfaces once that adapter lands).
+//! Live managers refresh operating-system interfaces at boot, configuration saves,
+//! and peer URL resolution. Mock and provided snapshots remain deterministic.
+//! TODO: refresh shared policy caches on OS network events (Linux rtnetlink and
+//! corresponding Windows/macOS notifications), with debounce and parity tests.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -80,9 +72,13 @@ pub struct NetworkManager {
     lan_subnets: Vec<IpNetwork>,
     excluded_subnets: Vec<IpNetwork>,
     trust_all_ipv6_interfaces: bool,
-    /// Test seam mirroring the C# `MockNetworkSettings` static; empty means
-    /// "use live interfaces" (deferred → empty list).
-    mock_network_settings: String,
+    interface_source: InterfaceSource,
+}
+
+enum InterfaceSource {
+    Mock(String),
+    Provided(Vec<IpData>),
+    Live,
 }
 
 impl NetworkManager {
@@ -90,8 +86,8 @@ impl NetworkManager {
     ///
     /// `mock_network_settings` mirrors the C# `MockNetworkSettings` static: a
     /// `<IPAddress>,<Index>,<Name>` triple per interface, interfaces separated
-    /// by `|`. Empty selects live enumeration (currently deferred → no
-    /// interfaces).
+    /// by `|`. Empty deliberately supplies no interfaces. Use [`Self::live`]
+    /// for operating-system enumeration.
     #[must_use]
     pub fn new(
         config: NetworkConfiguration,
@@ -110,7 +106,7 @@ impl NetworkManager {
             lan_subnets: Vec::new(),
             excluded_subnets: Vec::new(),
             trust_all_ipv6_interfaces: false,
-            mock_network_settings: mock_network_settings.into(),
+            interface_source: InterfaceSource::Mock(mock_network_settings.into()),
         };
 
         let config = manager.config.clone();
@@ -130,6 +126,45 @@ impl NetworkManager {
             mock_network_settings,
             Arc::new(NullLogger),
         )
+    }
+
+    /// Constructs a manager that enumerates live OS interfaces.
+    #[must_use]
+    pub fn live(config: NetworkConfiguration) -> Self {
+        let mut manager = Self::with_defaults(config, "");
+        manager.interface_source = InterfaceSource::Live;
+        manager.refresh_interfaces();
+        manager
+    }
+
+    /// Constructs a manager with an explicit, deterministic interface snapshot.
+    #[must_use]
+    pub fn with_interfaces(config: NetworkConfiguration, interfaces: Vec<IpData>) -> Self {
+        let mut manager = Self::with_defaults(config, "");
+        manager.set_interfaces(interfaces);
+        manager
+    }
+
+    /// Replaces the supplied snapshot, including with an intentionally empty list.
+    /// This switches a live manager to deterministic supplied interfaces.
+    pub fn set_interfaces(&mut self, interfaces: Vec<IpData>) {
+        self.interface_source = InterfaceSource::Provided(interfaces);
+        let config = self.config.clone();
+        self.update_settings(&config);
+    }
+
+    /// Refreshes live interfaces and dependent settings; injected snapshots stay fixed.
+    pub fn refresh_interfaces(&mut self) {
+        if matches!(self.interface_source, InterfaceSource::Live) {
+            let config = self.config.clone();
+            self.update_settings(&config);
+        }
+    }
+
+    /// Whether discovery should start for the next server lifetime.
+    #[must_use]
+    pub fn auto_discovery(&self) -> bool {
+        self.config.auto_discovery
     }
 
     /// Whether IPv4 is enabled (`IsIPv4Enabled`).
@@ -165,35 +200,39 @@ impl NetworkManager {
         self.initialize_lan(config);
         self.initialize_remote(config);
 
-        if self.mock_network_settings.is_empty() {
-            // Live enumeration deferred: start from no interfaces.
-            self.interfaces = Vec::new();
-        } else {
-            // Format is <IPAddress>,<Index>,<Name>: <next interface>.
-            let mut interfaces = Vec::new();
-            for details in self.mock_network_settings.split('|') {
-                let parts: Vec<&str> = details.split(',').collect();
-                if let Some(mut data) = net_utils::try_parse_to_subnet(parts[0], false) {
-                    if let Some(index) = parts.get(1).and_then(|p| p.parse::<i32>().ok()) {
-                        data.index = index;
-                        let family = data.address_family();
-                        if (family == AddressFamily::InterNetwork
-                            || family == AddressFamily::InterNetworkV6)
-                            && let Some(name) = parts.get(2)
-                        {
-                            (*name).clone_into(&mut data.name);
-                            interfaces.push(data);
-                        }
-                    }
-                } else {
-                    self.logger.warn(&format!(
-                        "Could not parse mock interface settings: {details}"
-                    ));
-                }
+        self.interfaces = match &self.interface_source {
+            InterfaceSource::Live => {
+                crate::interfaces::enumerate(config.enable_ipv4, config.enable_ipv6)
             }
+            InterfaceSource::Provided(interfaces) => interfaces.clone(),
+            InterfaceSource::Mock(settings) if settings.is_empty() => Vec::new(),
+            InterfaceSource::Mock(settings) => {
+                // Format is <IPAddress>,<Index>,<Name>: <next interface>.
+                let mut interfaces = Vec::new();
+                for details in settings.split('|') {
+                    let parts: Vec<&str> = details.split(',').collect();
+                    if let Some(mut data) = net_utils::try_parse_to_subnet(parts[0], false) {
+                        if let Some(index) = parts.get(1).and_then(|p| p.parse::<i32>().ok()) {
+                            data.index = index;
+                            let family = data.address_family();
+                            if (family == AddressFamily::InterNetwork
+                                || family == AddressFamily::InterNetworkV6)
+                                && let Some(name) = parts.get(2)
+                            {
+                                (*name).clone_into(&mut data.name);
+                                interfaces.push(data);
+                            }
+                        }
+                    } else {
+                        self.logger.warn(&format!(
+                            "Could not parse mock interface settings: {details}"
+                        ));
+                    }
+                }
 
-            self.interfaces = interfaces;
-        }
+                interfaces
+            }
+        };
 
         self.initialize_known_proxies(config);
         self.enforce_bind_settings(config);
@@ -766,6 +805,29 @@ impl NetworkManager {
             net_utils::format_ip_string(Some(available[0].address)),
             None,
         )
+    }
+
+    /// Resolves an advertised address while respecting the actual HTTP listener.
+    /// Published URL overrides take precedence over an explicit local bind. A
+    /// specific bind is the sole reachable candidate; it never trims policy state.
+    #[must_use]
+    pub fn get_bind_address_for_peer(
+        &self,
+        peer: IpAddr,
+        http_bind: Option<IpAddr>,
+    ) -> (String, Option<u16>) {
+        if let Some(result) =
+            self.matches_published_server_url(peer, !self.is_in_local_network(peer))
+        {
+            return result;
+        }
+        if let Some(bind) = http_bind.filter(|ip| !ip.is_unspecified()) {
+            if !bind.is_loopback() && !self.interfaces.iter().any(|iface| iface.address == bind) {
+                tracing::debug!(address = %bind, "HTTP bind address is absent from available interfaces; advertising the bound listener");
+            }
+            return (net_utils::format_ip_string(Some(bind)), None);
+        }
+        self.get_bind_address_for_ip(Some(peer), true)
     }
 
     /// The local (in-LAN) bind interfaces ordered by index

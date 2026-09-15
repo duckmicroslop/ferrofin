@@ -187,6 +187,11 @@ pub struct Config {
     /// Address the HTTP listener binds to. Parsed from `bind_addr`.
     pub bind_addr: IpAddr,
 
+    /// Internal discovery transport seam: production uses UDP 7359; test fixtures
+    /// disable it or select an isolated loopback endpoint. Not a file/env setting.
+    #[doc(hidden)]
+    pub discovery_bind_addr: Option<std::net::SocketAddr>,
+
     /// HTTP port to listen on. Default [`DEFAULT_HTTP_PORT`].
     pub port: u16,
 
@@ -482,6 +487,7 @@ impl Config {
             .var("FERROFIN_BASE_URL")
             .or(file.base_url)
             .unwrap_or_default();
+        let base_url = crate::base_url::normalize(&base_url);
 
         let omdb_api_key = env
             .var("FERROFIN_OMDB_KEY")
@@ -557,6 +563,7 @@ impl Config {
             cache_dir,
             web_dir,
             bind_addr,
+            discovery_bind_addr: Some(std::net::SocketAddr::from(([0, 0, 0, 0], 7359))),
             port,
             https_port,
             published_url,
@@ -665,6 +672,7 @@ impl Config {
             cache_dir: root.join("cache"),
             web_dir: root.join("web"),
             bind_addr: "127.0.0.1".parse().expect("literal IP parses"),
+            discovery_bind_addr: None,
             port: 0,
             https_port: 0,
             published_url: None,
