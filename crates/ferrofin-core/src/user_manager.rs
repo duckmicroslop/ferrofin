@@ -44,6 +44,7 @@ use ferrofin_model::configuration::{SubtitlePlaybackMode, UserConfiguration};
 use ferrofin_model::data::UnratedItem;
 use ferrofin_model::dto::{NameIdPair, UserDto};
 use ferrofin_model::users::{SyncPlayUserAccessType, UserPolicy};
+use ferrofin_util::string_extensions::upper_invariant;
 use sqlx::{Sqlite, SqliteExecutor};
 use uuid::Uuid;
 
@@ -300,14 +301,20 @@ impl FerrofinUserManager {
     where
         E: SqliteExecutor<'e>,
     {
+        // 12.0 `UserManager` (`RenameUser` :185, `CreateUserInternalAsync`
+        // :348): an exact match on `NormalizedUsername` against the
+        // `ToUpperInvariant` of the candidate — the same key the unique index
+        // guards, so a case-variant of an existing name is caught here (a
+        // `400`) instead of by the index (a `500`).
+        //
         // `IS NOT` (not `!=`): with no exclusion the bind is NULL, and
         // `"Id" != NULL` is NULL — i.e. matches nothing — where
         // `"Id" IS NOT NULL` is the intended "no exclusion".
         sqlx::query_scalar(
             r#"SELECT "Id" FROM "Users"
-               WHERE "Username" = ?1 COLLATE NOCASE AND "Id" IS NOT ?2 LIMIT 1"#,
+               WHERE "NormalizedUsername" = ?1 AND "Id" IS NOT ?2 LIMIT 1"#,
         )
-        .bind(name)
+        .bind(upper_invariant(name))
         .bind(exclude)
         .fetch_optional(executor)
         .await
@@ -412,9 +419,8 @@ impl FerrofinUserManager {
         .bind(internal_id)
         .bind(DEFAULT_PASSWORD_RESET_PROVIDER_ID)
         .bind(name)
-        // 12.0's `UpdateNormalizedUsername`: `ToUpperInvariant()` — Rust's
-        // Unicode uppercase, not SQL `upper()`, which is ASCII-only.
-        .bind(name.to_uppercase())
+        // 12.0 `User` constructor: `NormalizedUsername = Username.ToUpperInvariant()`.
+        .bind(upper_invariant(name))
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -465,6 +471,38 @@ fn require_valid_username(name: &str) -> Result<(), ServiceError> {
             "Usernames can contain unicode symbols, numbers (0-9), dashes (-), \
              underscores (_), apostrophes ('), and periods (.)",
         ))
+    }
+}
+
+impl FerrofinUserManager {
+    /// One-shot startup pass: rewrites every `Users.NormalizedUsername` that
+    /// is not [`upper_invariant`] of its `Username`, recording completion in
+    /// `FerrofinMeta` (`normalized_usernames_v12`) so later boots skip it —
+    /// [`ferrofin_db::normalized_usernames::repair_normalized_usernames`],
+    /// plus the auth-cache clear the rewrite demands.
+    ///
+    /// The migration that added the column filled it with SQL `upper()`, which
+    /// only folds ASCII: a user named `münchen` was stored as `MüNCHEN`, and
+    /// every by-name lookup — login included — now compares against
+    /// `MÜNCHEN` and misses. Jellyfin 12.0 writes `ToUpperInvariant()` (its
+    /// EF backfill did the same), so this pass makes an adopted or migrated
+    /// database agree with what the lookups compute. Rows that already agree
+    /// (every ASCII name) are left untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServiceError`] when a query or the rewrite transaction
+    /// fails; the marker is written inside that transaction, so a failure
+    /// simply retries on the next boot.
+    pub async fn repair_normalized_usernames(&self) -> Result<u64, ServiceError> {
+        let repaired = ferrofin_db::normalized_usernames::repair_normalized_usernames(&self.db)
+            .await
+            .map_err(|e| ServiceError::Backend(e.to_string()))?;
+        if repaired > 0 {
+            // The rewritten keys are what token → user resolution matches on.
+            self.auth_cache.clear();
+        }
+        Ok(repaired)
     }
 }
 
@@ -531,13 +569,13 @@ impl UserManager for FerrofinUserManager {
     }
 
     async fn get_user_by_name(&self, name: &str) -> Result<Option<UserEntity>, ServiceError> {
-        // 10.11.8 has no NormalizedUsername column; Jellyfin matches usernames
-        // OrdinalIgnoreCase in memory. NOCASE is SQLite's ASCII equivalent — a
-        // documented, bounded divergence for non-ASCII usernames.
+        // 12.0 `UserManager.GetUserByName` (:163): an exact match on
+        // `NormalizedUsername` against `name.ToUpperInvariant()` — which is
+        // also how `AuthenticateUser` re-finds the user (:588, :594).
         sqlx::query_as::<_, UserEntity>(
-            r#"SELECT * FROM "Users" WHERE "Username" = ?1 COLLATE NOCASE LIMIT 1"#,
+            r#"SELECT * FROM "Users" WHERE "NormalizedUsername" = ?1 LIMIT 1"#,
         )
-        .bind(name)
+        .bind(upper_invariant(name))
         .fetch_optional(self.db.pool())
         .await
         .map_err(db_err)
@@ -579,7 +617,8 @@ impl UserManager for FerrofinUserManager {
         )
         .bind(guid_to_db(user_id))
         .bind(new_name)
-        .bind(new_name.to_uppercase())
+        // 12.0 `RenameUser` (:201-202): `NormalizedUsername = Username.ToUpperInvariant()`.
+        .bind(upper_invariant(new_name))
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -1825,11 +1864,17 @@ mod tests {
         assert!(user.hide_played_in_latest);
         assert_eq!(user.cast_receiver_id.as_deref(), Some("F007D354"));
 
-        // Duplicate (case-insensitive) is rejected.
-        assert!(matches!(
-            mgr.create_user("ALICE").await,
-            Err(ServiceError::InvalidInput(_))
-        ));
+        // Duplicate (case-insensitive) is rejected with Jellyfin's
+        // ArgumentException text — a 400, never the index's constraint error.
+        for variant in ["ALICE", "Alice", "aLiCe"] {
+            match mgr.create_user(variant).await {
+                Err(ServiceError::InvalidInput(msg)) => assert_eq!(
+                    msg,
+                    format!("A user with the name '{variant}' already exists.")
+                ),
+                other => panic!("{variant}: expected InvalidInput, got {other:?}"),
+            }
+        }
 
         let id = Uuid::parse_str(&user.id).expect("uuid");
         mgr.rename_user(id, "alice", "bob").await.expect("rename");
@@ -1847,6 +1892,103 @@ mod tests {
             mgr.rename_user(id, "bob", "..").await,
             Err(ServiceError::InvalidInput(_))
         ));
+
+        // Renaming onto a case-variant of ANOTHER user's name is the same 400.
+        let carol = mgr.create_user("carol").await.expect("create carol");
+        let carol_id = Uuid::parse_str(&carol.id).expect("uuid");
+        match mgr.rename_user(carol_id, "carol", "BOB").await {
+            Err(ServiceError::InvalidInput(msg)) => {
+                assert_eq!(msg, "A user with the name 'BOB' already exists.");
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+        // A user may still change their own name's case (12.0 excludes the
+        // user's own row from the clash check).
+        mgr.rename_user(id, "bob", "Bob").await.expect("recase");
+        let recased = mgr.get_user_by_id(id).await.expect("by id").expect("some");
+        assert_eq!(recased.username, "Bob");
+        assert_eq!(recased.normalized_username, "BOB");
+    }
+
+    /// The stored lookup key is `ToUpperInvariant` of the name and every
+    /// by-name path matches on it — so a non-ASCII name is found under any
+    /// casing, and the row carries the key the lookups compute.
+    #[tokio::test]
+    async fn usernames_are_matched_on_the_invariant_uppercase_key() {
+        let db = test_db().await;
+        let mgr = FerrofinUserManager::new(db.clone());
+
+        let user = mgr.create_user("münchen").await.expect("create");
+        assert_eq!(user.normalized_username, "MÜNCHEN");
+        for spelling in ["münchen", "MÜNCHEN", "München"] {
+            let found = mgr
+                .get_user_by_name(spelling)
+                .await
+                .expect("by name")
+                .unwrap_or_else(|| panic!("{spelling} must resolve"));
+            assert_eq!(found.id, user.id);
+        }
+        assert!(matches!(
+            mgr.create_user("MÜNCHEN").await,
+            Err(ServiceError::InvalidInput(_))
+        ));
+        // `ß` has no one-character uppercase: the key keeps it, so "straße"
+        // and "strasse" are two different users — exactly as in .NET.
+        let strasse = mgr.create_user("straße").await.expect("create ß");
+        assert_eq!(strasse.normalized_username, "STRAßE");
+        assert!(mgr.create_user("strasse").await.is_ok());
+
+        // Login goes through the same key.
+        let id = Uuid::parse_str(&user.id).expect("uuid");
+        mgr.change_password(id, "pw").await.expect("set pw");
+        let ok = mgr
+            .authenticate_user("MÜNCHEN", "pw", "127.0.0.1", true)
+            .await
+            .expect("auth");
+        assert!(ok.is_some());
+    }
+
+    /// The boot repair rewrites keys the migration's SQL `upper()` got wrong
+    /// (non-ASCII names), leaves agreeing rows alone, and runs once.
+    #[tokio::test]
+    async fn normalized_username_repair_rewrites_ascii_folded_keys_once() {
+        let db = test_db().await;
+        let mgr = FerrofinUserManager::new(db.clone());
+        // What migration 0030's `upper("Username")` produces for these names.
+        for (id, name) in [(0x51_u128, "münchen"), (0x52, "þór"), (0x53, "alice")] {
+            crate::test_support::seed_named_user(&db, Uuid::from_u128(id), name).await;
+        }
+        // The entity carries the stored key, so it is read back by id.
+        let stored = |id: u128| {
+            let mgr = FerrofinUserManager::new(db.clone());
+            async move {
+                mgr.get_user_by_id(Uuid::from_u128(id))
+                    .await
+                    .expect("by id")
+                    .expect("seeded")
+                    .normalized_username
+            }
+        };
+        assert_eq!(stored(0x51).await, "MüNCHEN", "the ASCII-only fold");
+        assert_eq!(stored(0x53).await, "ALICE");
+        // Until repaired, the non-ASCII user cannot be found by name at all.
+        assert!(mgr.get_user_by_name("münchen").await.expect("q").is_none());
+
+        assert_eq!(mgr.repair_normalized_usernames().await.expect("repair"), 2);
+        assert_eq!(stored(0x51).await, "MÜNCHEN");
+        assert_eq!(stored(0x52).await, "ÞÓR");
+        assert_eq!(stored(0x53).await, "ALICE");
+        assert!(mgr.get_user_by_name("münchen").await.expect("q").is_some());
+
+        // Second boot: the marker short-circuits the pass.
+        assert_eq!(mgr.repair_normalized_usernames().await.expect("again"), 0);
+        assert_eq!(
+            db.meta_get("normalized_usernames_v12")
+                .await
+                .expect("meta")
+                .as_deref(),
+            Some("1")
+        );
     }
 
     #[tokio::test]

@@ -121,6 +121,9 @@ pub struct BaseItemEntity {
     pub official_rating: Option<String>,
     /// The original title (`OriginalTitle`), if any.
     pub original_title: Option<String>,
+    /// The title's original language (`OriginalLanguage`, Jellyfin 12.0), if
+    /// known — the ISO 639-1 code TMDB reports (`original_language`).
+    pub original_language: Option<String>,
     /// The overview text (`Overview`), if any.
     pub overview: Option<String>,
     /// The owning item's `Guid`, hyphenated (`OwnerId`, self-ref FK →
@@ -484,6 +487,9 @@ pub struct MediaStreamInfoEntity {
     pub is_hearing_impaired: Option<bool>,
     /// Whether the video is interlaced (`IsInterlaced`), if known.
     pub is_interlaced: Option<bool>,
+    /// Whether the stream is in the title's original language — ffprobe's
+    /// `disposition.original` (`IsOriginal`, Jellyfin 12.0; `NOT NULL DEFAULT 0`).
+    pub is_original: bool,
     /// The key frames, as stored (`KeyFrames`), if any.
     pub key_frames: Option<String>,
     /// The stream language (`Language`), if any.

@@ -631,7 +631,7 @@ pub async fn build_app_state(
     let auth_cache = Arc::new(ferrofin_core::auth_cache::AuthCache::default());
     let activity: Arc<dyn ferrofin_traits::activity::ActivityManager> =
         Arc::new(FerrofinActivityManager::new(db.clone()));
-    let users: Arc<dyn ferrofin_traits::library::UserManager> = Arc::new(
+    let users_impl = Arc::new(
         FerrofinUserManager::new(db.clone())
             .with_server_id(server_id.clone())
             .with_profile_image_dir(
@@ -644,6 +644,19 @@ pub async fn build_app_state(
             // receivers — jellyfin-web shows no cast devices without one.
             .with_configuration(Arc::clone(&config_trait)),
     );
+    // One-shot: rewrite `NormalizedUsername` keys the schema migration filled
+    // with SQL `upper()` (ASCII-only) so non-ASCII names resolve — and log in —
+    // under the `ToUpperInvariant` key every lookup now computes.
+    match users_impl.repair_normalized_usernames().await {
+        Ok(0) => {}
+        Ok(repaired) => {
+            tracing::info!(repaired, "rewrote normalized username keys");
+        }
+        Err(err) => {
+            tracing::warn!(%err, "normalized-username repair failed; non-ASCII usernames may not resolve by name");
+        }
+    }
+    let users: Arc<dyn ferrofin_traits::library::UserManager> = users_impl;
     let user_data: Arc<dyn ferrofin_traits::library::UserDataManager> = Arc::new(
         FerrofinUserDataManager::new(db.clone(), Arc::clone(&config_trait)),
     );

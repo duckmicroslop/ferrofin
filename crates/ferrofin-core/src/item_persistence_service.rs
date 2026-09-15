@@ -1229,6 +1229,7 @@ impl FerrofinItemPersistenceService {
             .bind(&item.name)
             .bind(item.normalization_gain)
             .bind(&item.official_rating)
+            .bind(&item.original_language)
             .bind(&item.original_title)
             .bind(&item.overview)
             .bind(&item.owner_id)
@@ -2133,7 +2134,7 @@ const UPSERT_SQL: &str = r#"INSERT INTO "BaseItems" (
     "InheritedParentalRatingSubValue", "InheritedParentalRatingValue", "IsFolder",
     "IsInMixedFolder", "IsLocked", "IsMovie", "IsRepeat", "IsSeries", "IsVirtualItem",
     "LUFS", "MediaType", "Name", "NormalizationGain", "OfficialRating",
-    "OriginalTitle", "Overview", "OwnerId", "ParentId",
+    "OriginalLanguage", "OriginalTitle", "Overview", "OwnerId", "ParentId",
     "ParentIndexNumber", "Path", "PreferredMetadataCountryCode",
     "PreferredMetadataLanguage", "PremiereDate", "PresentationUniqueKey",
     "PrimaryVersionId", "ProductionLocations", "ProductionYear", "RunTimeTicks",
@@ -2143,7 +2144,7 @@ const UPSERT_SQL: &str = r#"INSERT INTO "BaseItems" (
 ) VALUES (
     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 ) ON CONFLICT("Id") DO UPDATE SET
     "Album" = excluded."Album", "AlbumArtists" = excluded."AlbumArtists",
     "Artists" = excluded."Artists", "Audio" = excluded."Audio",
@@ -2166,6 +2167,7 @@ const UPSERT_SQL: &str = r#"INSERT INTO "BaseItems" (
     "IsVirtualItem" = excluded."IsVirtualItem", "LUFS" = excluded."LUFS",
     "MediaType" = excluded."MediaType", "Name" = excluded."Name",
     "NormalizationGain" = excluded."NormalizationGain", "OfficialRating" = excluded."OfficialRating",
+    "OriginalLanguage" = excluded."OriginalLanguage",
     "OriginalTitle" = excluded."OriginalTitle",
     "Overview" = excluded."Overview", "OwnerId" = excluded."OwnerId",
     "ParentId" = excluded."ParentId", "ParentIndexNumber" = excluded."ParentIndexNumber",
@@ -3105,6 +3107,51 @@ mod tests {
             Some("0003")
         );
     }
+
+    /// `OriginalLanguage` (12.0) is written by both upsert statements and read
+    /// back by the entity.
+    #[tokio::test]
+    async fn original_language_round_trips_through_the_row() {
+        let db = test_db().await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let entity = ferrofin_db::entities::base_items::BaseItemEntity {
+            original_language: Some("ja".to_owned()),
+            ..named("Seven Samurai")
+        };
+        let id = entity.id.clone();
+        svc.save_items(std::slice::from_ref(&entity))
+            .await
+            .expect("save");
+        let read = |db: ferrofin_db::Database, id: String| async move {
+            sqlx::query_as::<_, ferrofin_db::entities::base_items::BaseItemEntity>(
+                r#"SELECT * FROM "BaseItems" WHERE "Id" = ?1"#,
+            )
+            .bind(id)
+            .fetch_one(db.pool())
+            .await
+            .expect("row")
+        };
+        assert_eq!(
+            read(db.clone(), id.clone())
+                .await
+                .original_language
+                .as_deref(),
+            Some("ja")
+        );
+        // The scan's statement carries the column too (and a later save can
+        // change it: the column is not lock-preserved).
+        let rescanned = ferrofin_db::entities::base_items::BaseItemEntity {
+            original_language: Some("en".to_owned()),
+            ..entity
+        };
+        svc.save_scanned_items(std::slice::from_ref(&rescanned))
+            .await
+            .expect("scan save");
+        assert_eq!(read(db, id).await.original_language.as_deref(), Some("en"));
+    }
+
+    // `ForcedSortName` short-circuits `CreateSortName` in C#: it is padded and
+    // lower-cased, but its articles and punctuation are left alone.
 
     // A `ForcedSortName` wins over the name, and since 12.0 it goes through
     // the same `GetSortName` cleaning as an auto-generated key (article and

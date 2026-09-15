@@ -88,6 +88,10 @@ pub struct UserEntity {
     pub sync_play_access: i32,
     /// The username as displayed (`Username`, unique).
     pub username: String,
+    /// The lookup key: `Username` through .NET `ToUpperInvariant`
+    /// (`NormalizedUsername`, unique; Jellyfin 12.0). Every by-name match is
+    /// an exact comparison on this column.
+    pub normalized_username: String,
 }
 
 /// A row of the `AccessSchedules` table — a time window during which a user
