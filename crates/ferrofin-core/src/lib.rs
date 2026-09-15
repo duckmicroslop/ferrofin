@@ -62,7 +62,9 @@
 //!   live-stream state and injecting `Arc<dyn MediaEncoder>` / `Arc<dyn
 //!   ProviderManager>` for probing;
 //! - [`user_view_manager`] — [`FerrofinUserViewManager`]
-//!   ([`ferrofin_traits::library::UserViewManager`]);
+//!   ([`ferrofin_traits::library::UserViewManager`]), with
+//!   [`user_view_repository`] holding the boot-time consolidation of
+//!   localized views onto their Jellyfin 12.0 ids;
 //! - [`search_manager`] — [`FerrofinSearchManager`]
 //!   ([`ferrofin_traits::library::SearchManager`]);
 //! - [`music_manager`] — [`FerrofinMusicManager`]
@@ -224,6 +226,7 @@ pub mod user_entity_ext;
 pub mod user_manager;
 pub mod user_root_folder;
 pub mod user_view_manager;
+pub mod user_view_repository;
 pub mod virtual_folder_manager;
 pub mod years;
 

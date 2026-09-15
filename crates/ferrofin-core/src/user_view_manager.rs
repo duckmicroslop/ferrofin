@@ -73,25 +73,29 @@ fn is_live_tv_view_row(row: &BaseItemEntity) -> bool {
 
 /// The Live TV `UserView`'s deterministic id under `mode` — free-standing so it
 /// can be asserted without a database (see [`FerrofinUserViewManager::live_tv_view_id`]).
+///
+/// The key is `path + "_namedview_" + viewType` — Jellyfin 12.0's
+/// `GetNamedView` (LibraryManager.cs:2997), which keeps the localized display
+/// name out of the id. It is the same derivation
+/// [`user_view_repository::consolidate_localized_user_views`] folds the
+/// 10.11-era name-keyed views onto, so a later boot never recreates a stale one.
+///
+/// [`user_view_repository::consolidate_localized_user_views`]: crate::user_view_repository::consolidate_localized_user_views
 fn live_tv_view_id_with(
     mode: &item_type_lookup::IdDerivation,
     view_path: &std::path::Path,
 ) -> Option<Uuid> {
-    item_type_lookup::derive_item_id_with(
-        mode,
-        BaseItemKind::UserView,
-        &format!(
-            "{}_namedview_{LIVE_TV_VIEW_NAME}",
-            view_path.to_string_lossy()
-        ),
-    )
+    crate::user_view_repository::named_view_id_at(mode, view_path, LIVE_TV_VIEW_TYPE)
 }
+
+/// The Live TV view's `CollectionType` member name — `CollectionType.livetv
+/// .ToString()`, the folder under `views/` and the tail of the id key.
+const LIVE_TV_VIEW_TYPE: &str = "livetv";
 
 /// The display name of the auto-provisioned Live TV view — C#
 /// `_localization.GetLocalizedString("HeaderLiveTV")` (LiveTvManager.cs:1263),
-/// which is "Live TV" in the `en-US` default culture Ferrofin ships. It is part
-/// of the view's id key (`… + "_namedview_" + name`), so changing it changes the
-/// id.
+/// which is "Live TV" in the `en-US` default culture Ferrofin ships. Since
+/// 12.0 it is display-only: the id is keyed on [`LIVE_TV_VIEW_TYPE`].
 const LIVE_TV_VIEW_NAME: &str = "Live TV";
 
 /// The display name of the auto-provisioned playlists media folder
@@ -375,13 +379,12 @@ impl FerrofinUserViewManager {
     }
 
     /// The deterministic Live TV `UserView` item id — `GetNewItemId(path +
-    /// "_namedview_" + name, typeof(UserView))` over
-    /// `{InternalMetadataPath}/views/livetv`.
+    /// "_namedview_" + viewType, typeof(UserView))` over
+    /// `{InternalMetadataPath}/views/livetv` (Jellyfin 12.0; 10.11 keyed the
+    /// localized name instead, and those rows are consolidated at boot).
     ///
     /// `GetNewItemIdInternal` strips the program-data path before hashing, so
-    /// this id is the SAME on two servers with different data directories; the
-    /// value it produces for `Live TV` is Jellyfin's
-    /// `2b2bca16aacc8a14d53a11bb829eafa5`.
+    /// this id is the SAME on two servers with different data directories.
     fn live_tv_view_id(&self, view_path: &std::path::Path) -> Option<Uuid> {
         live_tv_view_id_with(&self.id_derivation, view_path)
     }
@@ -464,6 +467,30 @@ impl FerrofinUserViewManager {
             .save_items(std::slice::from_ref(&entity))
             .await?;
         Ok(Some(id))
+    }
+
+    /// One-shot boot repair: folds every 10.11-era `UserView` whose id was
+    /// derived from its localized name onto the name-independent id 12.0
+    /// derives from the view type — the port of Jellyfin's
+    /// `ConsolidateLocalizedUserViews` routine, keyed
+    /// [`user_views_consolidated_v12`](crate::user_view_repository::USER_VIEWS_CONSOLIDATED_META_KEY)
+    /// in `FerrofinMeta`. Returns the number of stale views dropped. No-op
+    /// without a database and a metadata path wired.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServiceError`] when the repair's transaction fails; it then
+    /// retries on the next boot.
+    pub async fn consolidate_localized_user_views(&self) -> Result<u64, ServiceError> {
+        let (Some(db), Some(metadata_path)) = (&self.db, &self.metadata_path) else {
+            return Ok(0);
+        };
+        crate::user_view_repository::consolidate_localized_user_views(
+            db,
+            &self.id_derivation,
+            metadata_path,
+        )
+        .await
     }
 }
 
@@ -1059,7 +1086,8 @@ mod tests {
     use crate::item_repository::FerrofinItemRepository;
     use crate::item_type_lookup::{ItemTypeLookup, stored_type_name};
     use crate::test_support::{
-        seed_item, seed_named_item, seed_user, seed_user_data, set_item_path, test_db,
+        seed_item, seed_item_with_data, seed_named_item, seed_user, seed_user_data, set_item_path,
+        test_db,
     };
     use ferrofin_db::Database;
     use ferrofin_db::store::guid_to_db;
@@ -1070,23 +1098,98 @@ mod tests {
 
     /// The Live TV view's id is derived from a key the C# strips the
     /// program-data path out of, so two servers with different data directories
-    /// agree on it. The expected value is the one a live Jellyfin 10.11.8 serves.
+    /// agree on it. The key is 12.0's `views/livetv_namedview_livetv` — NOT
+    /// the 10.11 `…_namedview_Live TV`, whose value
+    /// (`2b2bca16aacc8a14d53a11bb829eafa5`, what a live 10.11.8 serves) is the
+    /// stale id the boot consolidation folds onto this one.
     #[test]
-    fn live_tv_view_id_is_jellyfins_and_is_data_dir_independent() {
+    fn live_tv_view_id_is_jellyfin_12s_and_is_data_dir_independent() {
         for data_dir in ["/config", "/data", "/var/lib/ferrofin"] {
             let mode = item_type_lookup::IdDerivation::Jellyfin {
                 program_data_path: Some(data_dir.to_owned()),
             };
             let path = std::path::Path::new(data_dir).join("metadata/views/livetv");
+            let id = live_tv_view_id_with(&mode, &path)
+                .expect("id")
+                .simple()
+                .to_string();
+            assert_eq!(id, "54c4e8dbdc43511d9b3a452c48adf58a", "{data_dir}");
+            assert_ne!(id, "2b2bca16aacc8a14d53a11bb829eafa5", "{data_dir}");
             assert_eq!(
-                live_tv_view_id_with(&mode, &path)
-                    .expect("id")
-                    .simple()
-                    .to_string(),
-                "2b2bca16aacc8a14d53a11bb829eafa5",
-                "{data_dir}"
+                Some(id),
+                crate::user_view_repository::named_view_id(
+                    &mode,
+                    &std::path::Path::new(data_dir).join("metadata"),
+                    "livetv"
+                )
+                .map(|id| id.simple().to_string()),
+                "the provisioner and the consolidation agree on the canonical id"
             );
         }
+    }
+
+    /// The owner's real 12.0 database carries two `Playlists` views. After the
+    /// boot consolidation the user's view list names `Playlists` once.
+    #[tokio::test]
+    async fn consolidation_leaves_one_playlists_view_in_the_users_views() {
+        let db = test_db().await;
+        let user_id = Uuid::from_u128(0x5201);
+        seed_user(&db, user_id).await;
+        let mode = item_type_lookup::IdDerivation::Jellyfin {
+            program_data_path: Some("/config".to_owned()),
+        };
+        let metadata = std::path::PathBuf::from("/config/metadata");
+        let canonical =
+            crate::user_view_repository::named_view_id(&mode, &metadata, "playlists").expect("id");
+        let stale = item_type_lookup::derive_item_id_with(
+            &mode,
+            BaseItemKind::UserView,
+            "/config/metadata/views/Playlists_namedview_Playlists",
+        )
+        .expect("id");
+        for (id, path) in [
+            (canonical, "/config/metadata/views/playlists"),
+            (stale, "/config/metadata/views/Playlists"),
+        ] {
+            seed_item_with_data(
+                &db,
+                id,
+                BaseItemKind::UserView,
+                "Playlists",
+                r#"{"ViewType":"playlists"}"#,
+            )
+            .await;
+            set_item_path(&db, id, path).await;
+        }
+        let manager = manager(&db)
+            .with_database(db.clone())
+            .with_metadata_path(metadata)
+            .with_id_derivation(mode);
+
+        let before: Vec<Option<String>> = manager
+            .get_user_views(user_id)
+            .await
+            .expect("views")
+            .into_iter()
+            .map(|v| v.name)
+            .collect();
+        assert_eq!(before.len(), 2, "the duplicate is what 12.0 left behind");
+
+        assert_eq!(
+            manager
+                .consolidate_localized_user_views()
+                .await
+                .expect("consolidate"),
+            1
+        );
+        let after: Vec<(Uuid, Option<String>)> = manager
+            .get_user_views(user_id)
+            .await
+            .expect("views")
+            .into_iter()
+            .map(|v| (Uuid::parse_str(&v.id).expect("id"), v.name))
+            .collect();
+        assert_eq!(after, vec![(canonical, Some("Playlists".to_owned()))]);
     }
 
     fn manager(db: &Database) -> FerrofinUserViewManager {
