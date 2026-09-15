@@ -153,8 +153,13 @@ async fn restart_recreates_the_host_in_process_and_shutdown_exits() {
         .timeout(REQUEST_TIMEOUT)
         .build()
         .expect("client");
+    let discovery_addr = std::net::UdpSocket::bind("127.0.0.1:0")
+        .expect("reserve discovery endpoint")
+        .local_addr()
+        .expect("discovery address");
     let (server, base, name) = spawn_server(&client, |port| Config {
         server_name: "ferrofin-restart".to_owned(),
+        discovery_bind_addr: Some(discovery_addr),
         admin_user: ADMIN_USER.to_owned(),
         admin_password: ADMIN_PASSWORD.to_owned(),
         port,
@@ -177,6 +182,19 @@ async fn restart_recreates_the_host_in_process_and_shutdown_exits() {
         }
     };
     assert_eq!(metrics(&client).await, 200);
+    let discovered = discover(discovery_addr).await;
+    assert_eq!(discovered["Address"], base);
+    assert_eq!(discovered["Name"], name);
+    let public: serde_json::Value = client
+        .get(format!("{base}/System/Info/Public"))
+        .send()
+        .await
+        .expect("public info")
+        .json()
+        .await
+        .expect("public JSON");
+    assert_eq!(discovered["Id"], public["Id"]);
+    assert!(discovered["EndpointAddress"].is_null());
 
     // Restart: the listener goes away and comes back while `run` keeps running.
     let tok = token(&client, &base).await;
@@ -185,6 +203,30 @@ async fn restart_recreates_the_host_in_process_and_shutdown_exits() {
     wait_until(&client, &base, &name, true).await;
     assert!(!server.is_finished(), "a restart must not exit the process");
     assert_eq!(metrics(&client).await, 200, "/metrics survives the restart");
+    assert_eq!(
+        discover(discovery_addr).await,
+        discovered,
+        "discovery survives restart with stable identity"
+    );
+
+    // The toggle is persisted immediately, but the current socket remains active
+    // until the next lifetime, exactly like Jellyfin's hosted service.
+    let status = client
+        .post(format!("{base}/System/Configuration/network"))
+        .header("Authorization", format!("{CLIENT}, Token=\"{tok}\""))
+        .json(&serde_json::json!({"AutoDiscovery": false}))
+        .send()
+        .await
+        .expect("disable discovery")
+        .status();
+    assert!(status.is_success());
+    assert_eq!(discover(discovery_addr).await, discovered);
+    assert_eq!(post(&client, &base, "/System/Restart", &tok).await, 204);
+    wait_until(&client, &base, &name, false).await;
+    wait_until(&client, &base, &name, true).await;
+    let released = std::net::UdpSocket::bind(discovery_addr)
+        .expect("disabled lifetime does not bind discovery");
+    drop(released);
 
     // Shutdown: `run` returns.
     let tok = token(&client, &base).await;
@@ -202,6 +244,24 @@ async fn restart_recreates_the_host_in_process_and_shutdown_exits() {
         !is_up(&client, &base, &name).await,
         "shutdown leaves nothing listening"
     );
+}
+
+async fn discover(address: std::net::SocketAddr) -> serde_json::Value {
+    let client = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("UDP client");
+    client
+        .send_to(b"who is JellyfinServer?", address)
+        .await
+        .expect("discovery request");
+    let mut buffer = [0; 4096];
+    let (length, source) =
+        tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut buffer))
+            .await
+            .expect("discovery deadline")
+            .expect("discovery response");
+    assert_eq!(source, address);
+    serde_json::from_slice(&buffer[..length]).expect("discovery JSON")
 }
 
 async fn get_json(

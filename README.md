@@ -109,6 +109,9 @@ docker run -d --name ferrofin \
   ghcr.io/mangoleaf/ferrofin:latest
 ```
 
+For automatic LAN server discovery, see [server discovery deployment](docs/SERVER_DISCOVERY.md).
+The TCP mapping above supports manual URL connections; it does not forward discovery broadcasts.
+
 **Helm** (the chart is published as an OCI artifact next to the image):
 
 ```sh
