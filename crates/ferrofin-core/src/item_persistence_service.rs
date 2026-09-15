@@ -34,6 +34,10 @@ use crate::item_type_lookup::{MUSIC_GENRE_TYPES, stored_type_name};
 use crate::text_util::get_clean_value;
 use crate::translate_query::PLACEHOLDER_ID;
 
+/// One `Season` row as `recompute_season_keys` reads it:
+/// `(Id, SeriesId, IndexNumber, PresentationUniqueKey)`.
+type SeasonKeyRow = (String, Option<String>, Option<i64>, Option<String>);
+
 /// Maps an `ItemValues.Type` discriminant to the stored `BaseItems.Type` name of
 /// its browsable by-name item, or [`None`] for value types with no browse tab
 /// (tags, artists — handled elsewhere).
@@ -713,6 +717,257 @@ impl FerrofinItemPersistenceService {
         Ok(repaired)
     }
 
+    /// One-shot startup pass: recomputes `InheritedParentalRatingValue` /
+    /// `InheritedParentalRatingSubValue` from every row's OWN `OfficialRating`
+    /// — Jellyfin 12.0's `MigrateRatingLevels` routine
+    /// (`Jellyfin.Server/Migrations/Routines/20260302090000_MigrateRatingLevels.cs`),
+    /// recorded in `FerrofinMeta` so later boots skip it.
+    ///
+    /// In one transaction, for each DISTINCT `OfficialRating`: a null/empty
+    /// rating clears both columns; any other resolves through the localization
+    /// manager's `GetRatingScore` (server default country) and writes its
+    /// `Score`/`SubScore` — both NULL when the string does not resolve. Upstream
+    /// writes from the item's own rating only, with no parent walk, and so
+    /// does this. Returns the number of rows updated.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServiceError`] when a query or the transaction fails; the
+    /// marker is written inside the transaction, so a failure retries on the
+    /// next boot.
+    pub async fn repair_rating_levels(
+        &self,
+        localization: &dyn ferrofin_traits::localization::LocalizationManager,
+    ) -> Result<u64, ServiceError> {
+        const META_KEY: &str = "rating_levels_v12";
+        if self.repair_done(META_KEY).await? {
+            return Ok(0);
+        }
+        let ratings: Vec<Option<String>> =
+            sqlx::query_scalar(r#"SELECT DISTINCT "OfficialRating" FROM "BaseItems""#)
+                .fetch_all(self.db.pool())
+                .await
+                .map_err(db_err)?;
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        let mut updated: u64 = 0;
+        for rating in ratings {
+            let result = match rating.as_deref().filter(|r| !r.is_empty()) {
+                None => sqlx::query(
+                    r#"UPDATE "BaseItems"
+                       SET "InheritedParentalRatingValue" = NULL,
+                           "InheritedParentalRatingSubValue" = NULL
+                       WHERE "OfficialRating" IS NULL OR "OfficialRating" = ''"#,
+                )
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?,
+                Some(rating) => {
+                    let score = localization.get_rating_score(rating, None);
+                    sqlx::query(
+                        r#"UPDATE "BaseItems"
+                           SET "InheritedParentalRatingValue" = ?2,
+                               "InheritedParentalRatingSubValue" = ?3
+                           WHERE "OfficialRating" = ?1"#,
+                    )
+                    .bind(rating)
+                    .bind(score.map(|s| i64::from(s.score)))
+                    .bind(score.and_then(|s| s.sub_score).map(i64::from))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db_err)?
+                }
+            };
+            updated += result.rows_affected();
+        }
+        Self::mark_repair_done(&mut tx, META_KEY).await?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(updated)
+    }
+
+    /// One-shot startup pass: recomputes every `Series`' `PresentationUniqueKey`
+    /// under 12.0's rule ([`crate::kinds::series_presentation_unique_key`]) —
+    /// Jellyfin 12.0's `RecomputeSeriesPresentationKey` routine
+    /// (`Jellyfin.Server/Migrations/Routines/20260821120000_RecomputeSeriesPresentationKey.cs`),
+    /// recorded in `FerrofinMeta` so later boots skip it.
+    ///
+    /// Why keys move: 12.0 falls back to `series-{name}` when grouping is on
+    /// and the series has no provider id (10.11 kept the own id), and ORDERS
+    /// the library-folder ids before joining them. For every series the new
+    /// key is computed from its own name, provider ids, resolved metadata
+    /// language and collection folders ([`series_key_scope`] over `folders`);
+    /// when it differs the series row is updated and every row whose
+    /// `SeriesId` is the series is re-pointed (scoped by `SeriesId`,
+    /// deliberately not by the old key, which several libraries can share).
+    /// Then every `Season` with an `IndexNumber` whose series was processed
+    /// gets `{series key}-{index:000}`. Returns the rows changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServiceError`] when a query or the transaction fails; the
+    /// marker is written inside the transaction, so a failure retries on the
+    /// next boot.
+    pub async fn repair_series_presentation_keys(
+        &self,
+        folders: &[ferrofin_model::entities_media::VirtualFolderInfo],
+        default_metadata_language: &str,
+    ) -> Result<u64, ServiceError> {
+        const META_KEY: &str = "series_presentation_keys_v12";
+        if self.repair_done(META_KEY).await? {
+            return Ok(0);
+        }
+        #[allow(clippy::type_complexity)]
+        let series: Vec<(
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )> = sqlx::query_as(
+            r#"SELECT "Id", "Name", "Path", "TopParentId", "PreferredMetadataLanguage",
+                      "PresentationUniqueKey"
+               FROM "BaseItems" WHERE "Type" = ?1"#,
+        )
+        .bind(stored_type_name(BaseItemKind::Series).unwrap_or_default())
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        let ids: Vec<Uuid> = series
+            .iter()
+            .filter_map(|row| Uuid::parse_str(&row.0).ok())
+            .collect();
+        let provider_ids = self.provider_ids_for_items(&ids).await?;
+
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        let mut updated: u64 = 0;
+        // Every processed series, changed or not — a season whose own key went
+        // stale under an unchanged series key is repaired too (upstream fills
+        // `newSeriesKeys` before the equality check).
+        let mut new_keys: std::collections::HashMap<String, String> =
+            std::collections::HashMap::with_capacity(series.len());
+        for (id, name, path, top_parent_id, own_language, stored_key) in series {
+            let Ok(uuid) = Uuid::parse_str(&id) else {
+                continue;
+            };
+            let scope = series_key_scope(
+                folders,
+                default_metadata_language,
+                top_parent_id.as_deref(),
+                path.as_deref(),
+                own_language.as_deref(),
+            );
+            let key = crate::kinds::series_presentation_unique_key(
+                uuid,
+                scope.enable_automatic_series_grouping,
+                name.as_deref(),
+                provider_ids.get(&uuid).map_or(&[][..], Vec::as_slice),
+                scope.preferred_metadata_language.as_deref(),
+                &scope.collection_folder_ids,
+            );
+            new_keys.insert(id.clone(), key.clone());
+            if stored_key.as_deref() == Some(key.as_str()) {
+                continue;
+            }
+            sqlx::query(r#"UPDATE "BaseItems" SET "PresentationUniqueKey" = ?2 WHERE "Id" = ?1"#)
+                .bind(&id)
+                .bind(&key)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            updated += 1;
+            updated += sqlx::query(
+                r#"UPDATE "BaseItems" SET "SeriesPresentationUniqueKey" = ?2 WHERE "SeriesId" = ?1"#,
+            )
+            .bind(&id)
+            .bind(&key)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?
+            .rows_affected();
+        }
+        updated += Self::recompute_season_keys(&mut tx, &new_keys, None).await?;
+        Self::mark_repair_done(&mut tx, META_KEY).await?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(updated)
+    }
+
+    /// `RecomputeSeasonsAsync`: every `Season` with an `IndexNumber` whose
+    /// `SeriesId` is in `series_keys` gets `{series key}-{index:000}`
+    /// (`Season.CreatePresentationUniqueKey`) when it does not already carry
+    /// it. A season without an index number keeps the base key, which carries
+    /// no series key at all. Returns the rows changed.
+    ///
+    /// `only_series` narrows the season read to one series' rows (the
+    /// scan-time re-point, once per refreshed series); the boot repair passes
+    /// `None` and reads every season once.
+    async fn recompute_season_keys(
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        series_keys: &std::collections::HashMap<String, String>,
+        only_series: Option<&str>,
+    ) -> Result<u64, ServiceError> {
+        let seasons: Vec<SeasonKeyRow> = sqlx::query_as(
+            r#"SELECT "Id", "SeriesId", "IndexNumber", "PresentationUniqueKey"
+               FROM "BaseItems"
+               WHERE "Type" = ?1 AND "IndexNumber" IS NOT NULL
+                 AND (?2 IS NULL OR "SeriesId" = ?2)"#,
+        )
+        .bind(stored_type_name(BaseItemKind::Season).unwrap_or_default())
+        .bind(only_series)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(db_err)?;
+        let mut updated: u64 = 0;
+        for (id, series_id, index, stored_key) in seasons {
+            let Some((series_key, index)) = series_id
+                .as_deref()
+                .and_then(|sid| series_keys.get(sid))
+                .zip(index)
+            else {
+                continue;
+            };
+            let key = format!("{series_key}-{index:03}");
+            if stored_key.as_deref() == Some(key.as_str()) {
+                continue;
+            }
+            sqlx::query(r#"UPDATE "BaseItems" SET "PresentationUniqueKey" = ?2 WHERE "Id" = ?1"#)
+                .bind(&id)
+                .bind(&key)
+                .execute(&mut **tx)
+                .await
+                .map_err(db_err)?;
+            updated += 1;
+        }
+        Ok(updated)
+    }
+
+    /// Whether the one-shot repair recorded under `key` has already run on
+    /// this database.
+    async fn repair_done(&self, key: &str) -> Result<bool, ServiceError> {
+        let done = self
+            .db
+            .meta_get(key)
+            .await
+            .map_err(|e| ServiceError::Backend(e.to_string()))?;
+        Ok(done.as_deref() == Some("1"))
+    }
+
+    /// Records the one-shot repair `key` as done, inside the repair's own
+    /// transaction so a failed pass retries on the next boot.
+    async fn mark_repair_done(
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        key: &str,
+    ) -> Result<(), ServiceError> {
+        sqlx::query(
+            r#"INSERT INTO "FerrofinMeta" ("Key", "Value") VALUES (?1, '1')
+               ON CONFLICT("Key") DO UPDATE SET "Value" = '1'"#,
+        )
+        .bind(key)
+        .execute(&mut **tx)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
     /// Upserts a single item row (`INSERT … ON CONFLICT("Id") DO UPDATE`) using
     /// `sql` — [`UPSERT_SQL`] for a full-row replace, [`scan_upsert_sql`] for
     /// the library scan's ownership-respecting variant. Both bind the same
@@ -954,6 +1209,29 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             }
         }
         Ok(map)
+    }
+
+    async fn repoint_series_children(
+        &self,
+        series_id: Uuid,
+        key: &str,
+    ) -> Result<u64, ServiceError> {
+        let stored = guid_to_db(series_id);
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        let mut updated = sqlx::query(
+            r#"UPDATE "BaseItems" SET "SeriesPresentationUniqueKey" = ?2
+               WHERE "SeriesId" = ?1 AND "SeriesPresentationUniqueKey" IS NOT ?2"#,
+        )
+        .bind(&stored)
+        .bind(key)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        let keys = std::collections::HashMap::from([(stored.clone(), key.to_owned())]);
+        updated += Self::recompute_season_keys(&mut tx, &keys, Some(&stored)).await?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(updated)
     }
 
     async fn save_provider_id(
@@ -1882,6 +2160,84 @@ pub async fn backfill_missing_presentation_keys(db: &Database) -> Result<usize, 
     Ok(pending.len())
 }
 
+/// The library-side inputs of a series' presentation key — what C#
+/// `Series.CreatePresentationUniqueKey` reads off `LibraryManager` — resolved
+/// by [`series_key_scope`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeriesKeyScope {
+    /// `LibraryOptions.EnableAutomaticSeriesGrouping` of the owning library
+    /// (TRUE for a library with no saved options, upstream's default).
+    pub enable_automatic_series_grouping: bool,
+    /// `GetPreferredMetadataLanguage()`: the row's own value, else the
+    /// library's, else the server's; `None` when all three are blank.
+    pub preferred_metadata_language: Option<String>,
+    /// `GetCollectionFolders(series)`: every library whose locations include
+    /// the series' parent directory — in the caller's order; the key sorts
+    /// them.
+    pub collection_folder_ids: Vec<Uuid>,
+}
+
+/// Resolves a series' [`SeriesKeyScope`] from the configured libraries.
+///
+/// C# `GetCollectionFolders(item)` walks up to the top-level physical folder
+/// (the series' parent directory) and returns every `CollectionFolder` whose
+/// `PhysicalLocations` contain it, compared `OrdinalIgnoreCase` — which is
+/// how one show folder shared by two libraries lands in both. A series with
+/// no path (or one under no library) falls back to its `TopParentId` library
+/// alone. The library options come from the `TopParentId` library, else the
+/// first location match.
+#[must_use]
+pub fn series_key_scope(
+    folders: &[ferrofin_model::entities_media::VirtualFolderInfo],
+    default_metadata_language: &str,
+    top_parent_id: Option<&str>,
+    path: Option<&str>,
+    own_language: Option<&str>,
+) -> SeriesKeyScope {
+    fn blank(v: Option<&str>) -> Option<&str> {
+        v.map(str::trim).filter(|v| !v.is_empty())
+    }
+    let folder_id = |f: &ferrofin_model::entities_media::VirtualFolderInfo| {
+        f.item_id.as_deref().and_then(|id| Uuid::parse_str(id).ok())
+    };
+    let top_parent = top_parent_id.and_then(|id| Uuid::parse_str(id).ok());
+    let parent_dir = path
+        .and_then(|p| std::path::Path::new(p).parent())
+        .and_then(std::path::Path::to_str)
+        .map(|d| d.trim_end_matches('/'));
+    let located: Vec<&ferrofin_model::entities_media::VirtualFolderInfo> = parent_dir
+        .map(|dir| {
+            folders
+                .iter()
+                .filter(|f| {
+                    f.locations
+                        .iter()
+                        .any(|loc| loc.trim_end_matches('/').eq_ignore_ascii_case(dir))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let owning = top_parent
+        .and_then(|tp| folders.iter().find(|f| folder_id(f) == Some(tp)))
+        .or_else(|| located.first().copied());
+    let options = owning.and_then(|f| f.library_options.as_ref());
+    let mut collection_folder_ids: Vec<Uuid> =
+        located.iter().filter_map(|f| folder_id(f)).collect();
+    if collection_folder_ids.is_empty() {
+        collection_folder_ids.extend(top_parent);
+    }
+    let preferred_metadata_language = blank(own_language)
+        .or_else(|| blank(options.and_then(|o| o.preferred_metadata_language.as_deref())))
+        .or_else(|| blank(Some(default_metadata_language)))
+        .map(str::to_owned);
+    SeriesKeyScope {
+        enable_automatic_series_grouping: options
+            .is_none_or(|o| o.enable_automatic_series_grouping),
+        preferred_metadata_language,
+        collection_folder_ids,
+    }
+}
+
 /// The `PresentationUniqueKey` to store for `item`.
 ///
 /// Derived at write time for the same reason `CleanName` and `SortName` are:
@@ -1908,12 +2264,12 @@ fn derive_presentation_key(item: &BaseItemEntity) -> Option<String> {
     // A `Series` keeps whatever is stored. Upstream's key depends on
     // `LibraryOptions.EnableAutomaticSeriesGrouping` — which defaults to TRUE
     // (`LibraryOptions.cs:34`) and then derives the key from the provider ids,
-    // the metadata language and the library folders (`Series.cs:81`). That
-    // option is not ported, so recomputing here would flip every re-saved
-    // series on such a server to its own id and orphan its seasons'
-    // `SeriesPresentationUniqueKey`. (The verification library has the option
-    // off on every TV folder, which is why its 126 series all store own-id and
-    // the adoption suite cannot see this.)
+    // the metadata language and the library folders (`Series.cs:79`). Those
+    // inputs live with the library scan (`kinds::series_presentation_unique_key`
+    // over a `series_key_scope`), not with a bare row, so recomputing here
+    // would flip every re-saved series on such a server to its own id and
+    // orphan its seasons' `SeriesPresentationUniqueKey`. The scan and the
+    // `series_presentation_keys_v12` boot repair are the two writers of it.
     if kind == BaseItemKind::Series && stored.is_some() {
         return stored.map(str::to_owned);
     }
@@ -3026,6 +3382,365 @@ mod tests {
             key(&db, movie).await.as_deref(),
             Some("00000000000000000000000000005e03"),
             "but a movie's key IS reproducible, so it is recomputed"
+        );
+    }
+
+    /// The `rating_levels_v12` repair (Jellyfin 12.0 `MigrateRatingLevels`):
+    /// every row's inherited rating columns are recomputed from its OWN
+    /// `OfficialRating` through `GetRatingScore` — a bare age, a US table
+    /// entry with a sub-score, a "Rated R" spelling — and cleared when the
+    /// rating is blank or resolves to nothing. It runs once per database.
+    #[tokio::test]
+    async fn repair_rating_levels_writes_scores_from_each_rows_own_rating() {
+        use crate::test_support::{fetch_item, save_item, seed_named_item};
+        // (item id, OfficialRating, expected Score, expected SubScore)
+        type RatingCase = (u128, Option<&'static str>, Option<i64>, Option<i64>);
+        let db = test_db().await;
+        let service = FerrofinItemPersistenceService::new(db.clone());
+        let localization = crate::localization_manager::LocalizationManager::new("US");
+        let cases: [RatingCase; 5] = [
+            (0x7A01, Some("12"), Some(12), None),
+            (0x7A02, Some("TV-MA"), Some(17), Some(1)),
+            (0x7A03, Some("Rated R"), Some(17), Some(0)),
+            (0x7A04, Some("unknown-junk"), None, None),
+            (0x7A05, None, None, None),
+        ];
+        for (id, rating, _, _) in cases {
+            let id = Uuid::from_u128(id);
+            seed_named_item(&db, id, BaseItemKind::Movie, "Film").await;
+            let mut row = fetch_item(&db, id).await;
+            row.official_rating = rating.map(str::to_owned);
+            // Stale values a pre-12.0 build (or a parent walk) left behind.
+            row.inherited_parental_rating_value = Some(99);
+            row.inherited_parental_rating_sub_value = Some(99);
+            save_item(&db, &row).await;
+        }
+        let unrated_rows: i64 = sqlx::query_scalar(
+            r#"SELECT count(*) FROM "BaseItems"
+               WHERE "OfficialRating" IS NULL OR "OfficialRating" = ''"#,
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("count");
+
+        let updated = service
+            .repair_rating_levels(&localization)
+            .await
+            .expect("repair");
+
+        // Four rated rows plus every unrated one (upstream's blank-rating
+        // update matches the migration placeholder too).
+        assert_eq!(
+            updated,
+            4 + u64::try_from(unrated_rows).expect("count fits")
+        );
+        for (id, rating, score, sub_score) in cases {
+            let row = fetch_item(&db, Uuid::from_u128(id)).await;
+            assert_eq!(
+                (
+                    row.inherited_parental_rating_value,
+                    row.inherited_parental_rating_sub_value
+                ),
+                (score, sub_score),
+                "{rating:?}"
+            );
+        }
+        assert_eq!(
+            service
+                .repair_rating_levels(&localization)
+                .await
+                .expect("second run"),
+            0,
+            "the repair runs once per database"
+        );
+    }
+
+    /// `series_key_scope`: the language falls through row → library → server,
+    /// the folders are every library sharing the series' parent directory
+    /// (case-insensitively), and a series with no path falls back to its
+    /// `TopParentId` library alone.
+    #[test]
+    fn series_key_scope_resolves_language_and_folders_like_the_library_manager() {
+        use ferrofin_model::configuration::LibraryOptions;
+        use ferrofin_model::entities_media::VirtualFolderInfo;
+        let (a, b, c) = (
+            Uuid::from_u128(0xA),
+            Uuid::from_u128(0xB),
+            Uuid::from_u128(0xC),
+        );
+        let folder = |id: Uuid, location: &str, options: LibraryOptions| VirtualFolderInfo {
+            item_id: Some(id.to_string()),
+            locations: vec![location.to_owned()],
+            library_options: Some(options),
+            ..VirtualFolderInfo::default()
+        };
+        let folders = [
+            folder(a, "/media/TV/", LibraryOptions::default()),
+            folder(
+                b,
+                "/media/tv",
+                LibraryOptions {
+                    preferred_metadata_language: Some("de".to_owned()),
+                    enable_automatic_series_grouping: false,
+                    ..LibraryOptions::default()
+                },
+            ),
+            folder(c, "/media/anime", LibraryOptions::default()),
+        ];
+        let scope = |top: Uuid, path: Option<&str>, own: Option<&str>| {
+            super::series_key_scope(&folders, "en", Some(&guid_to_db(top)), path, own)
+        };
+
+        let shared = scope(a, Some("/media/tv/Show"), None);
+        assert_eq!(shared.collection_folder_ids, vec![a, b]);
+        assert!(
+            shared.enable_automatic_series_grouping,
+            "library A's options"
+        );
+        assert_eq!(shared.preferred_metadata_language.as_deref(), Some("en"));
+
+        let german = scope(b, Some("/media/tv/Show"), None);
+        assert!(
+            !german.enable_automatic_series_grouping,
+            "library B's options"
+        );
+        assert_eq!(german.preferred_metadata_language.as_deref(), Some("de"));
+        assert_eq!(
+            scope(b, Some("/media/tv/Show"), Some("fr"))
+                .preferred_metadata_language
+                .as_deref(),
+            Some("fr"),
+            "the row's own language wins"
+        );
+
+        let pathless = scope(c, None, None);
+        assert_eq!(pathless.collection_folder_ids, vec![c]);
+        assert_eq!(
+            scope(c, Some("/elsewhere/Show"), None).collection_folder_ids,
+            vec![c],
+            "under no library: the TopParentId library"
+        );
+    }
+
+    /// The `series_presentation_keys_v12` repair (Jellyfin 12.0
+    /// `RecomputeSeriesPresentationKey`) over a seeded series tree: a series
+    /// with a provider id in a shared location gets the id + language + both
+    /// folders (ordered), one without gets the `series-{name}` fallback, one in
+    /// a grouping-off library keeps its own id; every child is re-pointed by
+    /// `SeriesId`, indexed seasons get `{key}-{index:000}` (even under an
+    /// unchanged series key), an unindexed season keeps its own key. Runs once.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one seeded tree, asserted from every angle
+    async fn repair_series_presentation_keys_recomputes_the_tree() {
+        use crate::test_support::{
+            fetch_item, save_item, seed_item_of_series, seed_provider_id, seed_top_parented_item,
+            set_item_path,
+        };
+        use ferrofin_model::configuration::LibraryOptions;
+        use ferrofin_model::entities_media::VirtualFolderInfo;
+        async fn key(db: &ferrofin_db::Database, id: Uuid) -> Option<String> {
+            fetch_item(db, id).await.presentation_unique_key
+        }
+        async fn series_key(db: &ferrofin_db::Database, id: Uuid) -> Option<String> {
+            fetch_item(db, id).await.series_presentation_unique_key
+        }
+        let db = test_db().await;
+        let service = FerrofinItemPersistenceService::new(db.clone());
+        let (lib_a, lib_b, lib_c) = (
+            Uuid::from_u128(0xA),
+            Uuid::from_u128(0xB),
+            Uuid::from_u128(0xC),
+        );
+        let folder = |id: Uuid, location: &str, grouping: bool| VirtualFolderInfo {
+            item_id: Some(id.to_string()),
+            locations: vec![location.to_owned()],
+            library_options: Some(LibraryOptions {
+                enable_automatic_series_grouping: grouping,
+                ..LibraryOptions::default()
+            }),
+            ..VirtualFolderInfo::default()
+        };
+        let folders = [
+            folder(lib_a, "/media/tv", true),
+            folder(lib_b, "/media/tv", true),
+            folder(lib_c, "/media/anime", false),
+        ];
+        let (grouped, named, ungrouped) = (
+            Uuid::from_u128(0x5E01),
+            Uuid::from_u128(0x5E02),
+            Uuid::from_u128(0x5E03),
+        );
+        for (id, name, lib, path) in [
+            (grouped, "Breaking Bad", lib_a, "/media/tv/Breaking Bad"),
+            (named, "The Office", lib_a, "/media/tv/The Office"),
+            (
+                ungrouped,
+                "Cowboy Bebop",
+                lib_c,
+                "/media/anime/Cowboy Bebop",
+            ),
+        ] {
+            seed_top_parented_item(&db, id, BaseItemKind::Series, name, lib).await;
+            set_item_path(&db, id, path).await;
+        }
+        seed_provider_id(&db, grouped, "Tvdb", "81189").await;
+        // Children: two indexed seasons + a specials season + an episode under
+        // the grouped series, one indexed season under the ungrouped one.
+        let (s1, s2, specials, ep, s3) = (
+            Uuid::from_u128(0x5A01),
+            Uuid::from_u128(0x5A02),
+            Uuid::from_u128(0x5A03),
+            Uuid::from_u128(0x5A04),
+            Uuid::from_u128(0x5A05),
+        );
+        for (id, kind, name, series, index) in [
+            (s1, BaseItemKind::Season, "Season 1", grouped, Some(1)),
+            (s2, BaseItemKind::Season, "Season 2", grouped, Some(2)),
+            (specials, BaseItemKind::Season, "Specials", grouped, None),
+            (ep, BaseItemKind::Episode, "Pilot", grouped, Some(1)),
+            (s3, BaseItemKind::Season, "Session 1", ungrouped, Some(1)),
+        ] {
+            seed_item_of_series(&db, id, kind, name, series).await;
+            let mut row = fetch_item(&db, id).await;
+            row.index_number = index;
+            row.series_presentation_unique_key = Some("stale".to_owned());
+            save_item(&db, &row).await;
+        }
+        // The pre-12.0 state: every series keyed on its own id.
+        for id in [grouped, named, ungrouped] {
+            super::seed_presentation_key(&db, id, &id.as_simple().to_string()).await;
+        }
+
+        let updated = service
+            .repair_series_presentation_keys(&folders, "en")
+            .await
+            .expect("repair");
+
+        let grouped_key = format!("81189-en-{}-{}", lib_a.as_simple(), lib_b.as_simple());
+        assert_eq!(
+            key(&db, grouped).await.as_deref(),
+            Some(grouped_key.as_str())
+        );
+        assert_eq!(
+            key(&db, named).await.as_deref(),
+            Some(
+                format!(
+                    "series-the office-en-{}-{}",
+                    lib_a.as_simple(),
+                    lib_b.as_simple()
+                )
+                .as_str()
+            )
+        );
+        let own = ungrouped.as_simple().to_string();
+        assert_eq!(key(&db, ungrouped).await.as_deref(), Some(own.as_str()));
+        for child in [s1, s2, specials, ep] {
+            assert_eq!(
+                series_key(&db, child).await.as_deref(),
+                Some(grouped_key.as_str())
+            );
+        }
+        assert_eq!(
+            key(&db, s1).await.as_deref(),
+            Some(format!("{grouped_key}-001").as_str())
+        );
+        assert_eq!(
+            key(&db, s2).await.as_deref(),
+            Some(format!("{grouped_key}-002").as_str())
+        );
+        assert_eq!(
+            key(&db, specials).await.as_deref(),
+            Some(specials.as_simple().to_string().as_str()),
+            "a season without an index number keeps the base key"
+        );
+        assert_eq!(
+            series_key(&db, s3).await.as_deref(),
+            Some("stale"),
+            "an unchanged series re-points nothing by SeriesId"
+        );
+        assert_eq!(
+            key(&db, s3).await.as_deref(),
+            Some(format!("{own}-001").as_str()),
+            "…but its indexed season is still recomputed"
+        );
+        // grouped + named series rows, four children re-pointed, three seasons.
+        assert_eq!(updated, 2 + 4 + 3);
+        assert_eq!(
+            service
+                .repair_series_presentation_keys(&folders, "en")
+                .await
+                .expect("second run"),
+            0,
+            "the repair runs once per database"
+        );
+    }
+
+    /// `repoint_series_children` is the scan-time half of the same rule: rows
+    /// matched by `SeriesId` take the key, indexed seasons rebuild their own,
+    /// another series' children are untouched, and a repeat is a no-op.
+    #[tokio::test]
+    async fn repoint_series_children_follows_series_id_not_the_old_key() {
+        use crate::test_support::{fetch_item, save_item, seed_item_of_series, seed_named_item};
+        let db = test_db().await;
+        let service = FerrofinItemPersistenceService::new(db.clone());
+        let (series, other) = (Uuid::from_u128(0x5E11), Uuid::from_u128(0x5E12));
+        seed_named_item(&db, series, BaseItemKind::Series, "Show").await;
+        seed_named_item(&db, other, BaseItemKind::Series, "Other").await;
+        let (season, episode, other_season) = (
+            Uuid::from_u128(0x5A11),
+            Uuid::from_u128(0x5A12),
+            Uuid::from_u128(0x5A13),
+        );
+        for (id, kind, owner) in [
+            (season, BaseItemKind::Season, series),
+            (episode, BaseItemKind::Episode, series),
+            (other_season, BaseItemKind::Season, other),
+        ] {
+            seed_item_of_series(&db, id, kind, "child", owner).await;
+            let mut row = fetch_item(&db, id).await;
+            row.index_number = Some(3);
+            // Both series' children share the OLD key — the case that made
+            // upstream scope by SeriesId.
+            row.series_presentation_unique_key = Some("shared-old-key".to_owned());
+            save_item(&db, &row).await;
+        }
+
+        let updated = service
+            .repoint_series_children(series, "81189-en-lib")
+            .await
+            .expect("repoint");
+
+        assert_eq!(updated, 3, "two children re-pointed, one season rekeyed");
+        for id in [season, episode] {
+            assert_eq!(
+                fetch_item(&db, id)
+                    .await
+                    .series_presentation_unique_key
+                    .as_deref(),
+                Some("81189-en-lib")
+            );
+        }
+        assert_eq!(
+            fetch_item(&db, season)
+                .await
+                .presentation_unique_key
+                .as_deref(),
+            Some("81189-en-lib-003")
+        );
+        assert_eq!(
+            fetch_item(&db, other_season)
+                .await
+                .series_presentation_unique_key
+                .as_deref(),
+            Some("shared-old-key"),
+            "the other series' child keeps the shared old key"
+        );
+        assert_eq!(
+            service
+                .repoint_series_children(series, "81189-en-lib")
+                .await
+                .expect("repeat"),
+            0
         );
     }
 }

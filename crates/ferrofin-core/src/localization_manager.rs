@@ -501,62 +501,162 @@ impl LocalizationManager {
             .find_map(|value| self.single_rating_score(value, country_code))
     }
 
-    /// Resolves a single (already split) rating value.
+    /// Resolves a single (already split) rating value — C#
+    /// `GetSingleRatingScore` (`LocalizationManager.cs:396-465`).
     fn single_rating_score(
         &self,
         rating: &str,
         country_code: Option<&str>,
     ) -> Option<ParentalRatingScore> {
+        // Handle unrated content.
         if UNRATED_VALUES
             .iter()
             .any(|u| u.eq_ignore_ascii_case(rating))
         {
             return None;
         }
+        // Convert ints directly. This may override some of the locale
+        // specific age ratings (but those always map to the same age).
         if let Some(age) = parse_rating_as_score(rating) {
             return Some(ParentalRatingScore::new(age, None));
         }
 
-        // Strip a leading "Rated " / "Rated:" prefix.
-        let cleaned = rating
-            .trim_start_matches("Rated :")
-            .trim_start_matches("Rated:")
-            .trim_start_matches("Rated ")
-            .trim();
+        // Fairly common for some users to have "Rated R" in their rating
+        // field: every occurrence of the three spellings is removed, case
+        // insensitively (`LocalizationManager.cs:412-415` chains three
+        // `Replace(…, OrdinalIgnoreCase)` calls, so `rated: PG-13` cleans too).
+        let cleaned = ["Rated :", "Rated:", "Rated "]
+            .iter()
+            .fold(rating.to_owned(), |acc, prefix| {
+                remove_ignore_ascii_case(&acc, prefix)
+            });
+        let cleaned = cleaned.trim();
 
-        let country = country_code.unwrap_or(&self.metadata_country_code);
-        if let Some(table) = parental_ratings_for(country)
+        // Use the rating system matching the language.
+        if let Some(cc) = country_code.filter(|c| !c.is_empty()) {
+            if let Some(table) = parental_ratings_for(cc) {
+                if let Some(score) = table.by_name.get(cleaned) {
+                    return Some(*score);
+                }
+                // "US-PG-13" / "US:PG-13" with the country already known.
+                if cleaned.len() > cc.len()
+                    && cleaned
+                        .get(..cc.len())
+                        .is_some_and(|head| head.eq_ignore_ascii_case(cc))
+                    && matches!(cleaned.as_bytes()[cc.len()], b'-' | b':')
+                    && let Some(score) = cleaned
+                        .get(cc.len() + 1..)
+                        .and_then(|tail| table.by_name.get(tail.trim()))
+                {
+                    return Some(*score);
+                }
+            }
+        } else if let Some(table) = parental_ratings_for(&self.metadata_country_code)
             && let Some(score) = table.by_name.get(cleaned)
         {
+            // Fall back to the server default language for the ratings check.
             return Some(*score);
         }
 
-        // Fall back to a scan of every rating system.
+        // If we don't find anything, check all rating systems, starting with US.
+        if let Some(score) = parental_ratings_for("us").and_then(|t| t.by_name.get(cleaned)) {
+            return Some(*score);
+        }
         for table in PARENTAL_RATINGS.values() {
             if let Some(score) = table.by_name.get(cleaned) {
                 return Some(*score);
             }
         }
 
-        // Try "COUNTRY:rating" / "COUNTRY-rating" prefixes.
-        for sep in [':', '-'] {
-            if let Some((prefix, suffix)) = cleaned.split_once(sep) {
-                let suffix = suffix.trim();
-                if suffix.is_empty() {
-                    continue;
-                }
-                if let Some(table) = parental_ratings_for(prefix.trim()) {
-                    if let Some(score) = table.by_name.get(suffix) {
-                        return Some(*score);
-                    }
-                    if let Some(age) = parse_rating_as_score(suffix) {
-                        return Some(ParentalRatingScore::new(age, None));
-                    }
-                }
+        // Try splitting by a country prefix separator to handle "US:PG-13",
+        // "Germany: FSK-18", "DE-FSK-18".
+        for separator in [':', '-'] {
+            if let SeparatorLookup::Resolved(score) =
+                self.rating_score_by_separator(cleaned, separator)
+            {
+                return score;
             }
         }
         None
     }
+
+    /// C# `TryGetRatingScoreBySeparator`: [`SeparatorLookup::NotApplicable`]
+    /// when the separator does not apply (no separator, or nothing after it),
+    /// otherwise the resolved score — `Resolved(None)` when the country was
+    /// identified but its table knows neither the rating nor a number, which
+    /// upstream logs and treats as unrated.
+    fn rating_score_by_separator(&self, rating: &str, separator: char) -> SeparatorLookup {
+        let Some((country_part, rating_part)) = rating.split_once(separator) else {
+            return SeparatorLookup::NotApplicable;
+        };
+        let (country_part, rating_part) = (country_part.trim(), rating_part.trim());
+        if rating_part.is_empty() {
+            return SeparatorLookup::NotApplicable;
+        }
+        let resolved_country_code = if parental_ratings_for(country_part).is_some() {
+            Some(country_part.to_owned())
+        } else {
+            self.find_language_info(country_part)
+                .map(|culture| culture.two_letter_iso_language_name.clone())
+        };
+        if let Some(cc) = resolved_country_code.as_deref()
+            && let Some(table) = parental_ratings_for(cc)
+        {
+            if let Some(score) = table.by_name.get(rating_part) {
+                return SeparatorLookup::Resolved(Some(*score));
+            }
+            // Not a recognised rating string: fall back to using the number.
+            if let Some(age) = parse_rating_as_score(rating_part) {
+                return SeparatorLookup::Resolved(Some(ParentalRatingScore::new(age, None)));
+            }
+            // Upstream logs this at warning; it fires once per rating lookup
+            // (every scanned item), so it stays at debug here (LOGGING.md).
+            tracing::debug!(
+                rating,
+                country_code = cc,
+                "rating not found in the country's rating system; treating as unrated"
+            );
+            return SeparatorLookup::Resolved(None);
+        }
+        // Country not identified or no rating data available: recursive lookup.
+        SeparatorLookup::Resolved(
+            self.get_rating_score(rating_part, resolved_country_code.as_deref()),
+        )
+    }
+}
+
+/// The outcome of one `TryGetRatingScoreBySeparator` attempt — C#'s
+/// `bool` return plus its `out` score, which distinguishes "this separator
+/// does not apply, try the next" from "resolved (possibly to unrated)".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeparatorLookup {
+    /// No separator in the string, or nothing after it: try the next one.
+    NotApplicable,
+    /// The separator applied; this is the answer, `None` meaning unrated.
+    Resolved(Option<ParentalRatingScore>),
+}
+
+/// Removes every occurrence of `needle` from `haystack`, comparing ASCII
+/// case-insensitively — C# `string.Replace(needle, "", OrdinalIgnoreCase)`.
+fn remove_ignore_ascii_case(haystack: &str, needle: &str) -> String {
+    let mut out = String::with_capacity(haystack.len());
+    let mut rest = haystack;
+    while !rest.is_empty() {
+        let Some(at) = rest
+            .char_indices()
+            .find(|&(i, _)| {
+                rest.get(i..i + needle.len())
+                    .is_some_and(|slice| slice.eq_ignore_ascii_case(needle))
+            })
+            .map(|(i, _)| i)
+        else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..at]);
+        rest = &rest[at + needle.len()..];
+    }
+    out
 }
 
 /// Parses a rating as a number, allowing a trailing `+` (C# `TryParseRatingAsScore`).
@@ -771,6 +871,7 @@ mod tests {
     use std::sync::Arc;
 
     use ferrofin_traits::localization::LocalizationManager as LocalizationManagerTrait;
+    use rstest::rstest;
 
     use super::*;
 
@@ -909,6 +1010,57 @@ mod tests {
         );
         // Country-prefixed.
         assert_eq!(m.get_rating_score("US:R", None).map(|s| s.score), Some(17));
+    }
+
+    /// The `GetSingleRatingScore` front half (`LocalizationManager.cs:396-416`):
+    /// unrated tokens are `None`, a bare integer (with or without `+`) is its
+    /// own age, and the `Rated`/`Rated:`/`Rated :` spellings are removed case
+    /// insensitively before the country tables are consulted. `Score`/`SubScore`
+    /// are what `MigrateRatingLevels` writes into the inherited columns.
+    #[rstest]
+    #[case("12", Some((12, None)))]
+    #[case("18+", Some((18, None)))]
+    #[case("TV-MA", Some((17, Some(1))))]
+    #[case("Rated R", Some((17, Some(0))))]
+    #[case("rated: PG-13", Some((13, Some(0))))]
+    #[case("Rated : R", Some((17, Some(0))))]
+    #[case("unknown-junk", None)]
+    #[case("N/A", None)]
+    #[case("not rated", None)]
+    #[case("NR", None)]
+    #[case("SE:15 / SE:15+ / SE:Från 15 år", Some((15, None)))]
+    #[case("R / unknown", Some((17, Some(0))))]
+    // A country prefix the tables do not know recurses on the rating part
+    // (`TryGetRatingScoreBySeparator`'s last branch); a known one resolves the
+    // rating in that table, then as a bare number.
+    #[case("US:PG-13", Some((13, Some(0))))]
+    #[case("US-PG-13", Some((13, Some(0))))]
+    #[case("Germany: 16", Some((16, None)))]
+    fn single_rating_scores_follow_get_rating_score(
+        #[case] rating: &str,
+        #[case] expected: Option<(i32, Option<i32>)>,
+    ) {
+        let m = LocalizationManager::default();
+        assert_eq!(
+            m.get_rating_score(rating, None)
+                .map(|s| (s.score, s.sub_score)),
+            expected
+        );
+    }
+
+    #[rstest]
+    #[case("Rated R", "Rated ", "R")]
+    #[case("rated R", "Rated ", "R")]
+    #[case("RATED: PG", "Rated:", " PG")]
+    #[case("PG", "Rated ", "PG")]
+    #[case("Rated Rated X", "Rated ", "X")]
+    #[case("", "Rated ", "")]
+    fn remove_ignore_ascii_case_drops_every_occurrence(
+        #[case] input: &str,
+        #[case] needle: &str,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(remove_ignore_ascii_case(input, needle), expected);
     }
 
     #[test]
