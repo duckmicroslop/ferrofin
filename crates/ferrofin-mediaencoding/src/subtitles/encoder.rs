@@ -740,7 +740,7 @@ fn detect_bomless_utf16(bytes: &[u8]) -> Option<&'static encoding_rs::Encoding> 
     }
     let mut even_nuls = 0usize;
     let mut odd_nuls = 0usize;
-    for pair in bytes.chunks_exact(2) {
+    for pair in bytes.as_chunks::<2>().0 {
         even_nuls += usize::from(pair[0] == 0);
         odd_nuls += usize::from(pair[1] == 0);
     }

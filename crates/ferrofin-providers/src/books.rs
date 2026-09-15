@@ -783,8 +783,7 @@ fn read_archive_entry_bytes(path: &str, wanted_lower: &str) -> Option<Vec<u8>> {
     let index = (0..archive.len()).find(|i| {
         archive
             .by_index(*i)
-            .ok()
-            .is_some_and(|e| e.name().to_lowercase() == wanted_lower)
+            .is_ok_and(|e| e.name().to_lowercase() == wanted_lower)
     })?;
     let mut entry = archive.by_index(index).ok()?;
     read_capped(&mut entry)

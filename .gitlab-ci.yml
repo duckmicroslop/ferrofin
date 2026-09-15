@@ -125,7 +125,7 @@ create-release:
 
 # ---------------------------------------------------------------------------
 # ci-image — the Rust CI base image (toolchain + rustfmt/clippy/nextest/llvm-cov),
-# built with kaniko and pushed to $CI_REGISTRY_IMAGE/ci:rust-1.97.1. The lint and
+# built with kaniko and pushed to $CI_REGISTRY_IMAGE/ci:rust-1.98.1. The lint and
 # coverage jobs use it as their `image:` so they don't reinstall tools every run.
 # Rebuilds automatically when ci/Dockerfile changes, on main or on the merge-request
 # pipeline that proposes the change; force a rebuild
@@ -143,7 +143,7 @@ ci-image:
     name: gcr.io/kaniko-project/executor:debug
     entrypoint: [""]
   variables:
-    CI_IMAGE: $CI_REGISTRY_IMAGE/ci:rust-1.97.1
+    CI_IMAGE: $CI_REGISTRY_IMAGE/ci:rust-1.98.1
   before_script:
     - mkdir -p /kaniko/.docker
     - AUTH="$(printf "%s:%s" "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" | base64 | tr -d '\n')"
@@ -307,7 +307,7 @@ sccache-creds:
 # ---------------------------------------------------------------------------
 lint:
   stage: test
-  image: $CI_REGISTRY_IMAGE/ci:rust-1.97.1   # toolchain + nextest/llvm-cov baked in
+  image: $CI_REGISTRY_IMAGE/ci:rust-1.98.1   # toolchain + nextest/llvm-cov baked in
   extends: .sccache
   variables:
     CARGO_TERM_COLOR: always
@@ -341,7 +341,7 @@ lint:
 # re-gated on the release pipeline.
 coverage:
   stage: test
-  image: $CI_REGISTRY_IMAGE/ci:rust-1.97.1   # toolchain + nextest/llvm-cov baked in
+  image: $CI_REGISTRY_IMAGE/ci:rust-1.98.1   # toolchain + nextest/llvm-cov baked in
   extends: .sccache
   variables:
     CARGO_HOME: $CI_PROJECT_DIR/.cargo
