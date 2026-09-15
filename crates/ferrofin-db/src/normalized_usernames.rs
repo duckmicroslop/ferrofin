@@ -73,7 +73,7 @@ mod tests {
     use super::{META_KEY, normalized_username, repair_normalized_usernames};
     use crate::Database;
 
-    /// Inserts a `Users` row keyed the way migration 0030's `upper()` did.
+    /// Inserts a `Users` row keyed the way migration 0032's `upper()` did.
     async fn seed(db: &Database, id: &str, username: &str) {
         sqlx::query(
             r#"INSERT INTO "Users"

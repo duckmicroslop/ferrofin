@@ -977,7 +977,7 @@ mod tests {
             &[&guid_to_db(e1), &guid_to_db(owned)],
         )
         .await;
-        // "No owner" is NULL: 10.11.8 stored the zero GUID, but 0030 (12.0's
+        // "No owner" is NULL: 10.11.8 stored the zero GUID, but 0032 (12.0's
         // ChangeOwnerIdToGuid) nulls it and the OwnerId foreign key forbids it
         // from ever being written again.
         exec(

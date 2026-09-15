@@ -1954,7 +1954,7 @@ mod tests {
     async fn normalized_username_repair_rewrites_ascii_folded_keys_once() {
         let db = test_db().await;
         let mgr = FerrofinUserManager::new(db.clone());
-        // What migration 0030's `upper("Username")` produces for these names.
+        // What migration 0032's `upper("Username")` produces for these names.
         for (id, name) in [(0x51_u128, "münchen"), (0x52, "þór"), (0x53, "alice")] {
             crate::test_support::seed_named_user(&db, Uuid::from_u128(id), name).await;
         }

@@ -83,7 +83,7 @@ service layer in inheritance disguise. Trait signatures traffic in
 `ferrofin-db` = sqlx + SQLite, runtime queries only (no compile-time
 `query!` macros, so no `DATABASE_URL` at build time). The schema is pinned
 **byte-equal to a real Jellyfin 12.0 database** (migrations through `0029` carried the
-10.11.8 shape; `0030` converges it) — that is what makes the
+10.11.8 shape; `0032` converges it) — that is what makes the
 drop-in adoption of an existing Jellyfin database possible (see the
 `schema_conformance` test). Ferrofin-own additions
 live in a collision-proof `Ferrofin*`/`FerrofinIX_*` namespace. Dynamic item

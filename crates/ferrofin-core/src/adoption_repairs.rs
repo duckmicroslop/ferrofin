@@ -275,7 +275,7 @@ async fn append_link(
 }
 
 /// `CleanupOrphanedExtras`: delete every item whose `OwnerId` is the
-/// placeholder — where 0030 (`AddForeignKeyToOwnerId`) re-pointed owners that
+/// placeholder — where 0032 (`AddForeignKeyToOwnerId`) re-pointed owners that
 /// no longer exist. Links are cleared first; the rows' children cascade.
 ///
 /// # Errors

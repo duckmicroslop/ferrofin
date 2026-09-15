@@ -973,7 +973,7 @@ async fn sort_name_browse_uses_the_index_and_the_pinned_shapes_do_not() {
     }
 }
 
-/// Since the 12.0 schema (migration 0030) no index leads with `Id` and `Type`
+/// Since the 12.0 schema (migration 0032) no index leads with `Id` and `Type`
 /// together, and a lone `Type` equality ties with the `Id` primary key in the
 /// planner's costing — and wins, turning an id-list lookup into a scan of every
 /// row of that type. Each id-list query therefore writes the type column as

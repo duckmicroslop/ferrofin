@@ -1,7 +1,7 @@
--- 0031: Ferrofin-side hygiene on the 12.0 shape. Runs on EVERY path — a fresh
--- database, an upgraded install, an adopted 10.11.8 database (after 0030
--- executed) and an adopted 12.0 database (where 0030 was baselined). It is
--- never baselined. (The LinkedChildren fold is 0032, which lands together with
+-- 0033: Ferrofin-side hygiene on the 12.0 shape. Runs on EVERY path — a fresh
+-- database, an upgraded install, an adopted 10.11.8 database (after 0032
+-- executed) and an adopted 12.0 database (where 0032 was baselined). It is
+-- never baselined. (The LinkedChildren fold is 0034, which lands together with
 -- the code that reads the new key.)
 
 -- ── Indexes 12.0 dropped that Ferrofin's queries still plan on (D4) ─────

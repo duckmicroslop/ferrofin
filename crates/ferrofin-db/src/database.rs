@@ -1010,7 +1010,7 @@ pub struct JellyfinGeneration {
     pub baselined_versions: &'static [i64],
 }
 
-/// The generations Ferrofin adopts. `0031` is never baselined: it is the
+/// The generations Ferrofin adopts. `0033` is never baselined: it is the
 /// Ferrofin-side convergence and must run on every path.
 pub const JELLYFIN_GENERATIONS: [JellyfinGeneration; 2] = [
     JellyfinGeneration {
@@ -1021,7 +1021,7 @@ pub const JELLYFIN_GENERATIONS: [JellyfinGeneration; 2] = [
     JellyfinGeneration {
         name: "12.0.0",
         migration_ids: &JELLYFIN_12_0_MIGRATIONS,
-        baselined_versions: &[1, 2, 3, 4, 5, 6, 7, 30],
+        baselined_versions: &[1, 2, 3, 4, 5, 6, 7, 32],
     },
 ];
 
@@ -1201,9 +1201,9 @@ const ADOPTION_TABLE_DDL: &str = r#"CREATE TABLE IF NOT EXISTS "FerrofinAdoption
 )"#;
 
 /// The migrations that rebuild Jellyfin-owned tables (the 12-step SQLite
-/// table-rebuild dance): `0007` (10.11.8 shape) and `0030` (12.0 shape). Each
+/// table-rebuild dance): `0007` (10.11.8 shape) and `0032` (12.0 shape). Each
 /// gets a file snapshot before it first applies — see [`backup_before_rebuild`].
-const REBUILD_MIGRATIONS: &[i64] = &[7, 30];
+const REBUILD_MIGRATIONS: &[i64] = &[7, 32];
 
 /// Snapshots the database file before a table-rebuilding migration first
 /// applies.
@@ -1980,7 +1980,7 @@ mod tests {
             .connect()
             .await
             .expect("connect with enforcement off");
-        // `AccessSchedules`, not `Permissions`: 0030 ports 12.0's
+        // `AccessSchedules`, not `Permissions`: 0032 ports 12.0's
         // RemoveOrphanedUserPermissionsAndPreferences and would legitimately
         // delete an orphaned permission row before the check ever saw it.
         sqlx::query(
@@ -2257,14 +2257,14 @@ mod tests {
     fn the_convergence_migration_is_never_baselined() {
         for generation in &JELLYFIN_GENERATIONS {
             assert!(
-                !generation.baselined_versions.contains(&31),
-                "{}: 0031 must run on every path",
+                !generation.baselined_versions.contains(&33),
+                "{}: 0033 must run on every path",
                 generation.name
             );
             assert!(generation.baselined_versions.contains(&7));
         }
-        assert!(JELLYFIN_GENERATIONS[1].baselined_versions.contains(&30));
-        assert!(!JELLYFIN_GENERATIONS[0].baselined_versions.contains(&30));
+        assert!(JELLYFIN_GENERATIONS[1].baselined_versions.contains(&32));
+        assert!(!JELLYFIN_GENERATIONS[0].baselined_versions.contains(&32));
     }
 
     #[tokio::test]
@@ -2284,10 +2284,10 @@ mod tests {
         let recorded = i64::try_from(versions.len()).expect("small count");
         assert_eq!(recorded, head, "every migration recorded");
         assert!(versions.contains(&7));
-        assert!(versions.contains(&30) && versions.contains(&31));
-        // 0030 EXECUTED here (the 10.11.8 shape had to be converged), so the
+        assert!(versions.contains(&32) && versions.contains(&33));
+        // 0032 EXECUTED here (the 10.11.8 shape had to be converged), so the
         // pre-rebuild snapshot exists; the adoption record names the generation.
-        assert!(path.with_extension("db.pre-0030").exists());
+        assert!(path.with_extension("db.pre-0032").exists());
         assert_eq!(
             db.adoption_state().await.expect("adoption state"),
             Some(AdoptionState {
@@ -2340,10 +2340,10 @@ mod tests {
         let versions = recorded_versions(&db).await;
         let head = MIGRATOR.iter().last().map_or(0, |m| m.version);
         assert_eq!(i64::try_from(versions.len()).expect("small"), head);
-        assert!(versions.contains(&30), "0030 baselined");
-        assert!(versions.contains(&31), "0031 executed");
-        // 0030 was baselined, never run: no rebuild happened, no snapshot.
-        assert!(!path.with_extension("db.pre-0030").exists());
+        assert!(versions.contains(&32), "0032 baselined");
+        assert!(versions.contains(&33), "0033 executed");
+        // 0032 was baselined, never run: no rebuild happened, no snapshot.
+        assert!(!path.with_extension("db.pre-0032").exists());
         assert!(path.with_extension("db.pre-ferrofin").exists());
         assert_eq!(
             db.adoption_state().await.expect("adoption state"),
@@ -2352,7 +2352,7 @@ mod tests {
                 membership_import_done: false
             })
         );
-        // 0031's hygiene ran on this path too.
+        // 0033's hygiene ran on this path too.
         assert!(!table_exists(&db, "sqlite_stat1").await);
         let ef_rows: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM "__EFMigrationsHistory""#)
             .fetch_one(db.pool())

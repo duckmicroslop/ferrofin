@@ -11,7 +11,7 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 ## [Unreleased]
 
 ### Database
-- Converge the schema on Jellyfin 12.0 (migrations 0030–0032): table rebuilds with a
+- Converge the schema on Jellyfin 12.0 (migrations 0032–0034): table rebuilds with a
   pre-rebuild snapshot, 12.0's index set (Ferrofin's 14 duplicate `BaseItems` indexes are
   not recreated), `LinkedChildren` as the only membership store
 - Pin id-list queries to the primary key: 12.0 drops

@@ -1,4 +1,4 @@
--- 0032: LinkedChildren becomes the only membership store.
+-- 0034: LinkedChildren becomes the only membership store.
 --
 -- Runs on EVERY path (never baselined). On an adopted 12.0 database the
 -- source table is empty (0009 created it) and this is a no-op; everywhere

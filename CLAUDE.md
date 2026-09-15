@@ -132,7 +132,7 @@ Behavior that was a `virtual` method on `BaseItem` becomes a **free function ove
 `sqlx::migrate!()` for the schema. **Do not use the compile-time `query!`/`query_as!`
 macros** — they require a live `DATABASE_URL` at build/CI time, which we deliberately avoid.
 The schema is an ordered migration chain (`crates/ferrofin-db/migrations/`) whose
-Jellyfin-owned shape is **pinned byte-equal to a real Jellyfin 12.0 database** (`0030` converges the
+Jellyfin-owned shape is **pinned byte-equal to a real Jellyfin 12.0 database** (`0032` converges the
 10.11.8 shape the chain carried through `0029`; the gate adopts the exact 10.11.8 and 12.0.0
 `__EFMigrationsHistory` sets) — that is
 what makes drop-in adoption of an existing Jellyfin DB possible (point Ferrofin at it and it
@@ -140,10 +140,10 @@ migrates in place). Ferrofin-own tables/indexes live in a collision-proof
 `Ferrofin*`/`FerrofinIX_*` namespace. The `schema_conformance` test guards the pin.
 
 **Adoption is one-way, and every doc must say so.** The migration chain rebuilds several
-Jellyfin-owned tables (0007, 0030) and normalises stored values (GUID casing, presentation keys),
+Jellyfin-owned tables (0007, 0032) and normalises stored values (GUID casing, presentation keys),
 so a database Ferrofin has migrated is not guaranteed to open under Jellyfin again. The
 adoption path copies the original to `jellyfin.db.pre-ferrofin` before touching it and logs
-the path; the table-rebuilding migrations (`0007`, `0030`) each snapshot the file to
+the path; the table-rebuilding migrations (`0007`, `0032`) each snapshot the file to
 `jellyfin.db.pre-00NN` first, and every file-backed boot runs `PRAGMA foreign_key_check`; returning to Jellyfin means restoring that backup. Never describe the swap as
 two-way or round-trip in user-facing text. (Suite v3 exercises adoption — every server
 boots a disposable copy of a Jellyfin-scanned database and Ferrofin migrates it in place —

@@ -1,4 +1,4 @@
--- 0030: converge the Jellyfin-owned schema on Jellyfin 12.0.
+-- 0032: converge the Jellyfin-owned schema on Jellyfin 12.0.
 --
 -- Ferrofin keeps ONE runtime schema. Through 0029 it was byte-equal to a real
 -- Jellyfin 10.11.8 database; from here it is byte-equal to a real Jellyfin
@@ -11,12 +11,12 @@
 -- byte-derived from that fixture, plus the data statements those migrations
 -- run. It is BASELINED (recorded, never executed) on an adopted 12.0 database,
 -- which already has this shape — so nothing Ferrofin-specific belongs here;
--- that is 0031, which runs on every path.
+-- that is 0033, which runs on every path.
 --
 -- Table rebuilds follow 0007's 12-step dance and rely on the boot connection
 -- running migrations with foreign_keys = OFF (DROP TABLE would otherwise
 -- cascade-delete every child row — see database.rs); the boot then runs
--- PRAGMA foreign_key_check unconditionally. A file snapshot (<db>.pre-0030) is
+-- PRAGMA foreign_key_check unconditionally. A file snapshot (<db>.pre-0032) is
 -- taken before this file first applies.
 
 PRAGMA defer_foreign_keys = ON;
