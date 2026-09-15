@@ -486,7 +486,9 @@ fn utf16_with_bom(bytes: &[u8]) -> String {
         [0xfe, 0xff, rest @ ..] | rest => (rest, false),
     };
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             if little_endian {
                 u16::from_le_bytes([pair[0], pair[1]])
@@ -502,7 +504,9 @@ fn utf16_with_bom(bytes: &[u8]) -> String {
 /// Decodes a UTF-16LE byte run, as the Windows `XP*` TIFF tags store text.
 fn utf16le(bytes: &[u8]) -> String {
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .take_while(|unit| *unit != 0)
         .collect();

@@ -210,7 +210,7 @@ fn parse_hex(mut bytes: &[u8]) -> Option<u32> {
 /// Folds exactly 32 hex digits into a UUID, rejecting any non-hex character.
 fn uuid_from_hex_digits(digits: &[u8]) -> Option<Uuid> {
     let mut out = [0_u8; 16];
-    for (index, pair) in digits.chunks_exact(2).enumerate() {
+    for (index, pair) in digits.as_chunks::<2>().0.iter().enumerate() {
         let high = char::from(pair[0]).to_digit(16)?;
         let low = char::from(pair[1]).to_digit(16)?;
         *out.get_mut(index)? = u8::try_from((high << 4) | low).ok()?;
