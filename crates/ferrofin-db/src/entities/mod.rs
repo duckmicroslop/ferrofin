@@ -68,10 +68,10 @@ mod tests {
                 "MaxActiveSessions", "MustUpdatePassword",
                 "PasswordResetProviderId", "PlayDefaultAudioTrack",
                 "RememberAudioSelections", "RememberSubtitleSelections", "RowVersion",
-                "SubtitleMode", "SyncPlayAccess", "Username"
+                "SubtitleMode", "SyncPlayAccess", "Username", "NormalizedUsername"
             ) VALUES (
                 ?1, 'auth', 0, 0, 0, 0, 0, 1, 0, 42, 0, 5, 0,
-                'reset', 1, 1, 1, 7, 1, 2, 'ada'
+                'reset', 1, 1, 1, 7, 1, 2, 'ada', 'ADA'
             )"#,
         )
         .bind(guid_to_db(id))

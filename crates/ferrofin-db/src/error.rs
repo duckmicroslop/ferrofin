@@ -10,6 +10,17 @@ use thiserror::Error;
 /// map onto a known enum discriminant or a valid `Guid`.
 #[derive(Debug, Error)]
 pub enum DbError {
+    /// Two existing accounts would share the same invariant username key.
+    #[error(
+        "username normalization collision between accounts {first:?} and {second:?}; resolve their names in the original server and retry migration; accounts were not merged"
+    )]
+    UsernameCollision {
+        /// First account ID and displayed name.
+        first: (String, String),
+        /// Second account ID and displayed name.
+        second: (String, String),
+    },
+
     /// A `sqlx` connection, pool, or query error.
     #[error("database error: {0}")]
     Sqlx(#[from] sqlx::Error),

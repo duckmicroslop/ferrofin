@@ -51,15 +51,8 @@ sudo apt-get install -y "./ferrofin_${V}_$A.deb"
 The package creates the `ferrofin` system user and `/var/lib/ferrofin/data`, installs the
 unit, and **does not enable or start it**: the first boot logs the generated admin password
 once, and you want to be watching when it does. Give the `ferrofin` user read access to your
-media first, typically by adding it to the group that owns the library, then:
-
-```sh
-sudo systemctl enable --now ferrofin
-journalctl -u ferrofin -f                         # the admin password is logged here once
-```
-
-Set `admin_password` in `/etc/ferrofin/config.toml` before the first start for a headless
-install. Then open `http://host:8096/web`.
+media, typically by adding it to the group that owns the library. Keep the service stopped
+until you choose the fresh-install or migration procedure in step 4 below.
 
 ### Without the package: the release tarball
 
@@ -83,11 +76,11 @@ sudo mkdir -p /etc/systemd/system/ferrofin.service.d
 printf '[Service]\nExecStart=\nExecStart=/usr/local/bin/ferrofin-server --config /etc/ferrofin/config.toml\n' \
   | sudo tee /etc/systemd/system/ferrofin.service.d/binary.conf
 sudo systemctl daemon-reload
-sudo systemctl enable --now ferrofin
 ```
 
 The drop-in repoints `ExecStart=` at `/usr/local/bin`; everything else in the unit is
-shared with the package.
+shared with the package. The unit is installed but **not started yet**. Choose the
+fresh-install or migration procedure below before starting it.
 
 ## 3. The unit
 
@@ -108,29 +101,141 @@ client explicitly through `FERROFIN_FFMPEG_PATH`, `FERROFIN_FFPROBE_PATH` and
 `FERROFIN_WEB_DIR`, because systemd's `PATH` does not include `/usr/lib/jellyfin-ffmpeg`
 and discovery would otherwise land on Debian's `/usr/bin/ffmpeg`.
 
-## 4. Migrating a Jellyfin database
+## 4. First startup: choose one path
 
-Stop Jellyfin, then copy three things from its data directory (`/var/lib/jellyfin` on a
-Debian install, the `/config` volume in Docker) into `/var/lib/ferrofin/data`:
+### Fresh install
+
+If you are migrating from Jellyfin, skip this subsection. Starting against an empty data
+directory creates `ferrofin.db` and JSON configuration, which take precedence over the
+Jellyfin database and XML files you would copy later.
 
 ```sh
-sudo cp -a /var/lib/jellyfin/data/jellyfin.db /var/lib/ferrofin/data/jellyfin.db
-sudo cp -a /var/lib/jellyfin/root            /var/lib/ferrofin/data/   # library definitions
-sudo cp -a /var/lib/jellyfin/metadata        /var/lib/ferrofin/data/   # images, NFO cache
-sudo chown -R ferrofin:ferrofin /var/lib/ferrofin/data
+sudo systemctl enable --now ferrofin
+journalctl -u ferrofin -f
 ```
 
-The database holds the items, users and watch state. The library definitions are folders
-under `root/default/`, one per library with its `.mblink` path shortcuts and `options.xml`
-(imported into Ferrofin's `options.json` on first read); without them the admin Libraries
-page is empty. The images live under `metadata/`; without them every poster is a blurhash
-placeholder. Ferrofin adopts a **Jellyfin 10.11.8 through 10.11.11** database on first
-boot, writing `jellyfin.db.pre-ferrofin` beside it first. The adoption is one-way; going
-back to Jellyfin means restoring that copy. [`docs/UPGRADING.md`](UPGRADING.md) has the
-full notes.
+On a fresh database the log prints the generated `admin` password once; record it. For a
+headless install, set `admin_password` in `/etc/ferrofin/config.toml` (or
+`FERROFIN_ADMIN_PASSWORD` in the unit) before first start. Open `http://host:8096/web`.
 
-A database from any other Jellyfin version is refused with a message naming the unexpected
-migration ids. Bring it to 10.11.x under Jellyfin first.
+### Migrate an existing Jellyfin installation
+
+Ferrofin adopts **Jellyfin 10.11.8 through 10.11.11** databases. It refuses unknown
+migration histories. Upgrade an older installation to a supported version under Jellyfin
+before copying it; do not edit migration history to bypass the check.
+
+#### Stop both servers and copy the complete state
+
+Keep Jellyfin and Ferrofin stopped throughout the copy. The example below uses the Debian
+package layout: all data in `/var/lib/jellyfin`, with configuration stored separately in
+`/etc/jellyfin`. Change both source paths for your installation. For Docker, stop the
+container and use the host paths of its data/config mounts; layouts vary by image.
+
+Copy **all files**, including hidden files, from the entire data and configuration
+directories. Preserve the directory structure: `data/jellyfin.db` can stay nested because
+Ferrofin detects that layout. Include the database's `-wal` and `-shm` companions when
+present. Do not copy a database while either server is writing to it.
+
+```sh
+sudo sh <<'SH'
+set -eu
+systemctl stop jellyfin ferrofin
+source_data=/var/lib/jellyfin
+source_config=/etc/jellyfin
+destination=/var/lib/ferrofin/data
+
+test -d "$source_data"
+test -d "$source_config"
+test -f "$source_data/data/jellyfin.db" || test -f "$source_data/jellyfin.db"
+test -f "$source_config/system.xml"
+test -f "$source_config/network.xml"
+
+# An independent backup, readable only by root. Originals are left in place.
+backup=$(mktemp -d /var/lib/ferrofin-migration.XXXXXX)
+printf 'Migration backup: %s\n' "$backup"
+mkdir "$backup/jellyfin-data" "$backup/jellyfin-config"
+cp -a "$source_data/." "$backup/jellyfin-data/"
+cp -a "$source_config/." "$backup/jellyfin-config/"
+
+# Preserve a previous Ferrofin installation, including its DB, WAL and JSON.
+# Mixing it into the copy would cause its database/settings to win on startup.
+if [ -e "$destination" ]; then
+    mv "$destination" "$backup/previous-ferrofin-data"
+fi
+mkdir -p "$destination"
+cp -a "$backup/jellyfin-data/." "$destination/"
+# A copied config symlink must not send writes back into the original install.
+if [ -L "$destination/config" ]; then
+    mv "$destination/config" "$backup/copied-config-symlink"
+fi
+mkdir -p "$destination/config"
+cp -a "$backup/jellyfin-config/." "$destination/config/"
+chown -R ferrofin:ferrofin "$destination"
+SH
+```
+
+If a preflight check fails, verify the source paths and locate the missing file before
+continuing. If the destination is a mount point, use a separate empty destination and
+update `data_dir` and the unit's writable paths instead of moving the mount point.
+
+This copies library definitions (`root/default/`), metadata and images (`metadata/`),
+playlists, plugin files, and configuration alongside the database. Jellyfin .NET plugins
+are retained in the copy but cannot run in Ferrofin; they require Ferrofin-compatible
+replacements. A copied symbolic link still points at its original target: separately back
+up any external state directories and arrange access to them. Include any separately
+configured cache, metadata, or configuration directories in your backup as well.
+
+The destination's `config/` is Ferrofin's default `config_dir` for this guide. If you set
+`config_dir` explicitly, copy the configuration there instead, using a clean destination.
+`network.xml` is essential: it carries remote-access policy, IP filters, trusted proxies,
+and local-network definitions. Omitting it restores defaults, including remote access
+enabled and an empty IP filter. Existing Ferrofin JSON takes precedence over copied XML,
+which is why the example preserves the previous destination and starts with a clean one.
+
+#### Unicode usernames
+
+Usernames retain their displayed spelling. Lookup and uniqueness use ICU simple uppercase
+with .NET's invariant-casing exceptions: `münchen` and `MÜNCHEN` identify the same
+account, but `i` and dotless `ı` remain distinct. This also applies to account creation
+and renaming. Accents are not stripped and visually similar letters from different
+scripts are not merged.
+
+Older Ferrofin installations may already contain case-variant duplicates. Migration
+checks all normalized keys before changing username data and refuses collisions with
+the account IDs and names. Resolve conflicting names in the original installation,
+then retry from a clean copy. Do not delete or combine accounts to bypass the error.
+
+#### Check paths, start, and verify adoption
+
+Keep media available at the paths stored by Jellyfin, or update the library paths before
+scanning. If Jellyfin used a custom metadata directory, copy its contents into the new
+`metadata/` directory: the XML import intentionally excludes Jellyfin's `MetadataPath`.
+Machine-specific encoder, cache, and certificate paths are also not automatically carried
+over; configure those for this host, including HTTPS if your deployment requires it.
+
+```sh
+sudo systemctl enable --now ferrofin
+journalctl -u ferrofin -f
+```
+
+Verify the following before resuming normal use:
+
+- The journal reports database adoption and the `jellyfin.db.pre-ferrofin` backup beside
+  the adopted database. Investigate any configuration-import warnings.
+- Your existing users can log in, and watch history, libraries, library settings, and
+  artwork are present. Library `options.xml` files are imported into `options.json`.
+- Remote access, IP filters, trusted proxies, and local-network definitions match your
+  intended policy; check them before exposing the replacement server to remote clients.
+- Playback uses the configured jellyfin-ffmpeg executable.
+
+The copy includes all source files, but only settings supported by Ferrofin are imported;
+review warnings about unsupported fields. Keep Jellyfin stopped while Ferrofin uses the
+same media paths, and prevent its service/container from automatically restarting.
+
+Adoption is one-way. To roll back, stop Ferrofin and restart Jellyfin against its untouched
+original state, or restore the full backup while both are stopped. Do not point Jellyfin
+at the adopted database. Changes made in Ferrofin after migration are not copied back.
+See [`docs/UPGRADING.md`](UPGRADING.md).
 
 ## Upgrading
 

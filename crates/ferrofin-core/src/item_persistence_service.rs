@@ -1991,7 +1991,9 @@ fn was_written_by_the_old_rule(source: Option<&str>, stored: Option<&str>) -> bo
         // row; filling it in is safe and is what a save would do anyway.
         return stored.is_none();
     };
-    let cleaned = get_clean_value(source);
+    // This detector must retain the old full-lowercase mapping even though
+    // the replacement key now uses invariant casing.
+    let cleaned = ferrofin_util::string_extensions::remove_diacritics(source).to_lowercase();
     let old: String = {
         let mut out = String::with_capacity(cleaned.len());
         let mut last_was_space = false;
@@ -2936,6 +2938,27 @@ mod tests {
     /// stripped punctuation is repaired in place on the next boot — otherwise a
     /// person, studio or genre with a `.` or `-` in its name stays unreachable
     /// by name until someone runs a full rescan.
+    #[tokio::test]
+    async fn unicode_old_punctuation_repair_retains_legacy_detection() {
+        let db = test_db().await;
+        let id = Uuid::new_v4();
+        crate::test_support::seed_named_item(&db, id, BaseItemKind::Person, "ΟΣ.").await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "CleanName" = 'ος' WHERE "Id" = ?1"#)
+            .bind(ferrofin_db::store::guid_to_db(id))
+            .execute(db.writer())
+            .await
+            .unwrap();
+        let service = FerrofinItemPersistenceService::new(db.clone());
+        assert_eq!(service.repair_clean_values().await.unwrap(), 1);
+        let clean: String =
+            sqlx::query_scalar(r#"SELECT "CleanName" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(ferrofin_db::store::guid_to_db(id))
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(clean, "οσ.");
+    }
+
     #[tokio::test]
     async fn the_clean_value_repair_rewrites_stale_columns_once() {
         let db = test_db().await;

@@ -2,7 +2,7 @@
 //! (`MediaBrowser.Controller/Entities/BaseItem.cs`), with Jellyfin's default
 //! `SortRemoveWords` / `SortRemoveCharacters` / `SortReplaceCharacters`.
 
-use crate::string_extensions::remove_diacritics;
+use crate::string_extensions::{lower_invariant, remove_diacritics};
 
 /// `ServerConfiguration.SortRemoveWords` — leading/interior/trailing articles.
 const SORT_REMOVE_WORDS: [&str; 3] = ["the", "a", "an"];
@@ -28,7 +28,18 @@ const SORT_REPLACE_CHARACTERS: [char; 3] = ['.', '+', '%'];
 /// articles while the `.` is still attached, so nothing matches.
 #[must_use]
 pub fn create_sort_name(name: &str) -> String {
-    let mut sortable = name.trim().to_lowercase();
+    create_sort_name_with(name, lower_invariant)
+}
+
+/// The old full-lowercase derivation, only for recognizing stored keys during
+/// migration. Do not use this for new writes or query parameters.
+#[must_use]
+pub fn previous_create_sort_name(name: &str) -> String {
+    create_sort_name_with(name, str::to_lowercase)
+}
+
+fn create_sort_name_with(name: &str, lowercase: fn(&str) -> String) -> String {
+    let mut sortable = lowercase(name.trim());
     for search in SORT_REMOVE_WORDS {
         if let Some(rest) = sortable.strip_prefix(&format!("{search} ")) {
             sortable = rest.to_owned();
@@ -56,6 +67,12 @@ pub fn create_sort_name(name: &str) -> String {
 /// makes it comparable with derived keys.
 #[must_use]
 pub fn forced_sort_key(forced: &str) -> String {
+    lower_invariant(&modify_sort_chunks(forced))
+}
+
+/// Previous full-lowercase forced key, only for recognizing old stored values.
+#[must_use]
+pub fn previous_forced_sort_key(forced: &str) -> String {
     modify_sort_chunks(forced).to_lowercase()
 }
 

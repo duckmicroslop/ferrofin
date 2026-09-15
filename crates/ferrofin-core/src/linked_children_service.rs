@@ -86,13 +86,17 @@ impl LinkedChildrenService for FerrofinLinkedChildrenService {
         let Some(artist_type) = stored_type_name(BaseItemKind::MusicArtist) else {
             return Ok(result);
         };
-        let lower_names: Vec<String> = artist_names.iter().map(|n| n.to_lowercase()).collect();
+        let lower_names: Vec<String> = artist_names
+            .iter()
+            .map(|n| ferrofin_util::string_extensions::upper_invariant(n))
+            .collect();
 
         // All placeholders are anonymous `?`: SQLite forbids mixing numbered
         // (`?1`) and anonymous placeholders in one statement, and this query
         // builds a dynamic `IN (?, …)` list.
-        let mut sql =
-            String::from(r#"SELECT * FROM "BaseItems" WHERE "Type" = ? AND LOWER("Name") IN ("#);
+        let mut sql = String::from(
+            r#"SELECT * FROM "BaseItems" WHERE "Type" = ? AND ferrofin_upper_invariant("Name") IN ("#,
+        );
         for i in 0..lower_names.len() {
             if i > 0 {
                 sql.push_str(", ");
@@ -109,10 +113,15 @@ impl LinkedChildrenService for FerrofinLinkedChildrenService {
         // Group the matched artist rows back onto each requested name
         // (case-insensitively), only emitting names that matched at least one row.
         for name in artist_names {
-            let lower = name.to_lowercase();
+            let lower = ferrofin_util::string_extensions::upper_invariant(name);
             let matches: Vec<BaseItemEntity> = rows
                 .iter()
-                .filter(|r| r.name.as_deref().map(str::to_lowercase) == Some(lower.clone()))
+                .filter(|r| {
+                    r.name
+                        .as_deref()
+                        .map(ferrofin_util::string_extensions::upper_invariant)
+                        == Some(lower.clone())
+                })
                 .cloned()
                 .collect();
             if !matches.is_empty() {
@@ -353,6 +362,36 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[rstest::rstest]
+    #[case("Élodie", "élodie", true)]
+    #[case("ΟΣ", "ος", true)]
+    #[case("ς", "σ", true)]
+    #[case("ᾀ", "ᾈ", true)]
+    #[case("𐐨", "𐐀", true)]
+    #[case("ı", "I", false)]
+    #[case("İ", "i", false)]
+    #[case("ß", "ss", false)]
+    #[tokio::test]
+    async fn unicode_artist_lookup(
+        #[case] stored: &str,
+        #[case] query: &str,
+        #[case] matches: bool,
+    ) {
+        let db = test_db().await;
+        let id = Uuid::new_v4();
+        seed_named_item(&db, id, BaseItemKind::MusicArtist, stored).await;
+        let svc = FerrofinLinkedChildrenService::new(db);
+        let found = svc
+            .find_artists(&[query.to_owned(), "absent".to_owned()])
+            .await
+            .unwrap();
+        assert_eq!(found.contains_key(query), matches);
+        if matches {
+            assert_eq!(found[query][0].id, ferrofin_db::store::guid_to_db(id));
+        }
+        assert!(!found.contains_key("absent"));
     }
 
     #[tokio::test]

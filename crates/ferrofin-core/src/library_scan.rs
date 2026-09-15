@@ -6793,10 +6793,10 @@ fn merge_multi_value(existing: &mut Option<String>, incoming: &[String]) {
     }
     let mut values = split_pipe(existing.as_deref());
     let mut seen: std::collections::HashSet<String> =
-        values.iter().map(|v| v.to_lowercase()).collect();
+        values.iter().map(|v| ordinal_ignore_case_key(v)).collect();
     for value in incoming {
         let value = value.trim();
-        if !value.is_empty() && seen.insert(value.to_lowercase()) {
+        if !value.is_empty() && seen.insert(ordinal_ignore_case_key(value)) {
             values.push(value.to_owned());
         }
     }
@@ -7035,34 +7035,16 @@ fn distinct_ignoring_case<'a>(columns: impl Iterator<Item = Option<&'a str>>) ->
         .map(str::trim)
         .filter(|v| !v.is_empty())
     {
-        if seen.insert(value.to_lowercase()) {
+        if seen.insert(ordinal_ignore_case_key(value)) {
             out.push(value.to_owned());
         }
     }
     out
 }
 
-/// The grouping key of .NET's `StringComparer.OrdinalIgnoreCase`.
-///
-/// Ordinal-ignore-case is *invariant simple* case folding: .NET upper-cases one
-/// char to exactly one char and leaves a char whose mapping is not 1:1 alone.
-/// Rust's `str::to_lowercase` is the *full* Unicode mapping, which is a
-/// different comparer — under it `\u{3c2}` (final sigma) and `\u{3c3}` are
-/// distinct, where .NET folds both to `\u{3a3}` and calls them equal. Folding
-/// per char and keeping only the 1:1 results reproduces .NET exactly, including
-/// its non-folds (`\u{df}` stays, because `ToUpperInvariant` cannot expand it
-/// to `SS`).
+/// The invariant simple-uppercase key shared with username normalization.
 fn ordinal_ignore_case_key(value: &str) -> String {
-    value
-        .chars()
-        .map(|c| {
-            let mut upper = c.to_uppercase();
-            match (upper.next(), upper.next()) {
-                (Some(one), None) => one,
-                _ => c,
-            }
-        })
-        .collect()
+    ferrofin_util::string_extensions::upper_invariant(value)
 }
 
 /// The distinct values of a `|`-joined column across a set of children, ordered
@@ -7127,7 +7109,7 @@ fn assign_ordered(column: &mut Option<String>, values: &[String]) -> bool {
 /// assignment is unconditional.
 fn assign_from_children(column: &mut Option<String>, values: &[String]) -> bool {
     let normalize = |v: &[String]| {
-        let mut n: Vec<String> = v.iter().map(|s| s.to_lowercase()).collect();
+        let mut n: Vec<String> = v.iter().map(|s| ordinal_ignore_case_key(s)).collect();
         n.sort_unstable();
         n
     };
@@ -7395,6 +7377,40 @@ mod tests {
     use ferrofin_db::entities::base_items::BaseItemEntity;
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_traits::persistence::ItemPersistenceService as _;
+
+    #[rstest::rstest]
+    #[case("ς", "σ", true)]
+    #[case("ᾀ", "ᾈ", true)]
+    #[case("é", "É", true)]
+    #[case("𐐨", "𐐀", true)]
+    #[case("ı", "I", false)]
+    #[case("İ", "i", false)]
+    #[case("ß", "ss", false)]
+    fn unicode_metadata_names(#[case] first: &str, #[case] second: &str, #[case] equal: bool) {
+        let expected = if equal {
+            vec![first]
+        } else {
+            vec![first, second]
+        };
+        let columns = [Some(first), Some(second)];
+        assert_eq!(super::distinct_ignoring_case(columns.into_iter()), expected);
+        assert_eq!(
+            super::frequency_ordered_distinct(columns.into_iter()),
+            expected
+        );
+        let mut merged = Some(first.to_owned());
+        super::merge_multi_value(&mut merged, &[second.to_owned()]);
+        assert_eq!(merged.as_deref(), Some(expected.join("|").as_str()));
+        let mut assigned = Some(first.to_owned());
+        assert_eq!(
+            super::assign_from_children(&mut assigned, &[second.to_owned()]),
+            !equal
+        );
+        assert_eq!(
+            assigned.as_deref(),
+            Some(if equal { first } else { second })
+        );
+    }
 
     /// `AlbumMetadataService` groups the songs' artists with
     /// `StringComparer.OrdinalIgnoreCase`, which folds one char to one char and

@@ -29,8 +29,8 @@ async fn seed_user(db: &Database, id: Uuid) {
             "MaxActiveSessions", "MustUpdatePassword",
             "PasswordResetProviderId", "PlayDefaultAudioTrack",
             "RememberAudioSelections", "RememberSubtitleSelections",
-            "RowVersion", "SubtitleMode", "SyncPlayAccess", "Username")
-           VALUES (?1, '', 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, '', 1, 1, 1, 0, 0, 0, 'prefs')"#,
+            "RowVersion", "SubtitleMode", "SyncPlayAccess", "Username", "NormalizedUsername")
+           VALUES (?1, '', 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, '', 1, 1, 1, 0, 0, 0, 'prefs', 'PREFS')"#,
     )
     .bind(guid_to_db(id))
     .execute(db.writer())

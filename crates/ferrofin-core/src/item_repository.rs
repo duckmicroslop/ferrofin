@@ -11,6 +11,8 @@
 //! not taken as a field (it would be injected at the composition root if a later
 //! method needs it).
 
+use ferrofin_util::string_extensions::{lower_invariant, upper_invariant};
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -1606,10 +1608,10 @@ fn append_by_name_filters<'a>(
     let non_blank = |v: &'a Option<String>| v.as_deref().map(str::trim).filter(|s| !s.is_empty());
     append_predicates(qb, outer);
     if let Some(term) = non_blank(&filter.search_term) {
-        let lowered = term.to_lowercase();
+        let lowered = lower_invariant(term);
         if lowered.contains(SEARCH_WILDCARD_TERMS) {
             let like = format!("%{}%", lowered.trim_matches('%'));
-            qb.push(r#" AND lower(bi."CleanName") LIKE "#)
+            qb.push(r#" AND ferrofin_lower_invariant(bi."CleanName") LIKE "#)
                 .push_bind(like);
         } else {
             let like = format!(
@@ -1620,8 +1622,8 @@ fn append_by_name_filters<'a>(
         }
     }
     if let Some(prefix) = non_blank(&filter.name_starts_with) {
-        qb.push(r#" AND lower(COALESCE(bi."SortName", bi."Name")) LIKE "#)
-            .push_bind(format!("{}%", prefix.to_lowercase()));
+        qb.push(r#" AND ferrofin_upper_invariant(COALESCE(bi."SortName", bi."Name")) LIKE "#)
+            .push_bind(format!("{}%", upper_invariant(prefix)));
     }
     // Both bounds are FULL-STRING comparisons against the lowercased parameter,
     // over `SortName` only (C# `BaseItemRepository.cs:2036-2046`:
@@ -1630,12 +1632,12 @@ fn append_by_name_filters<'a>(
     // `nameStartsWithOrGreater=j` return the wrong page — and `>` instead of
     // `>=` dropped the boundary row itself.
     if let Some(boundary) = non_blank(&filter.name_starts_with_or_greater) {
-        qb.push(r#" AND bi."SortName" >= "#)
-            .push_bind(boundary.to_lowercase());
+        qb.push(r#" AND ferrofin_lower_invariant(bi."SortName") >= "#)
+            .push_bind(lower_invariant(boundary));
     }
     if let Some(boundary) = non_blank(&filter.name_less_than) {
-        qb.push(r#" AND bi."SortName" < "#)
-            .push_bind(boundary.to_lowercase());
+        qb.push(r#" AND ferrofin_lower_invariant(bi."SortName") < "#)
+            .push_bind(lower_invariant(boundary));
     }
 }
 
@@ -2695,6 +2697,65 @@ mod tests {
     use ferrofin_model::entities::ExtraType;
     use ferrofin_traits::persistence::ItemPersistenceService;
 
+    #[rstest::rstest]
+    #[case("Élodie", "él", true)]
+    #[case("ΟΣ", "οσ", true)]
+    #[case("𐐀 Star", "𐐨", true)]
+    #[case("ı", "I", false)]
+    #[case("ß", "ss", false)]
+    #[tokio::test]
+    async fn unicode_name_prefix(
+        #[case] stored: &str,
+        #[case] prefix: &str,
+        #[case] matches: bool,
+    ) {
+        let db = test_db().await;
+        let id = Uuid::new_v4();
+        seed_named_item(&db, id, BaseItemKind::Person, stored).await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "SortName" = ?1 WHERE "Id" = ?2"#)
+            .bind(stored)
+            .bind(guid_to_db(id))
+            .execute(db.writer())
+            .await
+            .unwrap();
+        let result = repo(&db)
+            .get_item_list(&InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::Person],
+                name_starts_with: Some(prefix.to_owned()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.iter().any(|row| row.id == guid_to_db(id)), matches);
+    }
+
+    #[rstest::rstest]
+    #[case("Élodie", "élodie")]
+    #[case("ΟΣ", "οσ")]
+    #[case("𐐀 Star", "𐐨 star")]
+    #[tokio::test]
+    async fn unicode_original_title_search(#[case] stored: &str, #[case] term: &str) {
+        let db = test_db().await;
+        let id = Uuid::new_v4();
+        seed_named_item(&db, id, BaseItemKind::Movie, "Unrelated title").await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "OriginalTitle" = ?1 WHERE "Id" = ?2"#)
+            .bind(stored)
+            .bind(guid_to_db(id))
+            .execute(db.writer())
+            .await
+            .unwrap();
+        let result = repo(&db)
+            .get_item_list(&InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::Movie],
+                search_term: Some(term.to_owned()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, guid_to_db(id));
+    }
+
     fn repo(db: &Database) -> FerrofinItemRepository {
         FerrofinItemRepository::new(db.clone(), Arc::new(ItemTypeLookup::new()))
     }
@@ -3352,7 +3413,7 @@ mod tests {
             // two forms are compared on a non-trivial row order.
             sqlx::query(r#"UPDATE "BaseItems" SET "SortName" = ?2 WHERE "Id" = ?1"#)
                 .bind(guid_to_db(Uuid::from_u128(n)))
-                .bind(name.to_lowercase())
+                .bind(lower_invariant(name))
                 .execute(db.writer())
                 .await
                 .expect("sort name");
