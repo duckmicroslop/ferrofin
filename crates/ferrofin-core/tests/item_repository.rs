@@ -181,8 +181,10 @@ async fn movie_page_fixture() -> (Database, InternalItemsQuery) {
         }
         rows.push(row);
     }
-    // A primary and alternate share a key, but a filter can leave only the
-    // alternate eligible. Filtering must precede representative selection.
+    // A primary and alternate share a key. The default browse hides the
+    // alternate behind its same-library primary. With owned items explicitly
+    // included, a year filter can leave only the alternate eligible, exercising
+    // filtering before representative selection.
     let mut alternate = rows.last().expect("movie 1").clone();
     alternate.id = Uuid::from_u128(0xD00).to_string();
     alternate.primary_version_id = Some(Uuid::from_u128(0xC01).to_string().to_uppercase());
@@ -220,9 +222,17 @@ async fn movie_page_fixture() -> (Database, InternalItemsQuery) {
 async fn movie_page_hydration_preserves_versions_filters_ties_and_totals() {
     let (db, base) = movie_page_fixture().await;
     let repository = repo(&db);
-    for years in [vec![], vec![1999], vec![2000], vec![2099]] {
+    for (years, include_owned_items) in [
+        (vec![], false),
+        (vec![], true),
+        (vec![1999], false),
+        (vec![1999], true),
+        (vec![2000], false),
+        (vec![2099], false),
+    ] {
         let unpaged = InternalItemsQuery {
             years,
+            include_owned_items,
             ..base.clone()
         };
         let all = movie_page_before_hydration_change(&db, &unpaged).await;
@@ -234,8 +244,14 @@ async fn movie_page_hydration_preserves_versions_filters_ties_and_totals() {
             );
             assert!(!all.iter().any(|row| row.primary_version_id.is_some()));
         } else if unpaged.years == [1999] {
-            assert_eq!(all.len(), 1);
-            assert!(all[0].primary_version_id.is_some());
+            // Filtering out the primary by year does not make its alternate
+            // visible under the 12.1 rule: the primary still exists in this
+            // library. Explicit inclusion bypasses that visibility predicate.
+            assert_eq!(all.len(), usize::from(include_owned_items));
+            if include_owned_items {
+                assert_eq!(all[0].id, Uuid::from_u128(0xD00).to_string().to_uppercase());
+                assert!(all[0].primary_version_id.is_some());
+            }
         }
         for limit in [0, 1, 5, 100, -1] {
             for offset in [0, 1, 5, 20, 23, 99] {
