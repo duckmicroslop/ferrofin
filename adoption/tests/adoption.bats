@@ -105,6 +105,20 @@ boot_log() { # boot_log <file> <generation> [extra-line…]
   [ "$output" = "foreign_key_check: 2 rows" ]
 }
 
+@test "check_db: a missing database reports both query failures on stdout" {
+  run bash -c '. "$1"; adoption_check_db "$2" 2>/dev/null' _ "$ADOPTION/lib.sh" missing.db
+  [[ "${lines[0]}" == 'integrity_check: sqlite3 failed:'* ]]
+  [[ "${lines[1]}" == 'foreign_key_check: sqlite3 failed:'* ]]
+  [ ! -e missing.db ]
+}
+
+@test "check_db: an invalid database reports both query failures on stdout" {
+  printf '%s\n' 'this is not a SQLite database' > invalid.db
+  run bash -c '. "$1"; adoption_check_db "$2" 2>/dev/null' _ "$ADOPTION/lib.sh" invalid.db
+  [[ "${lines[0]}" == 'integrity_check: sqlite3 failed:'* ]]
+  [[ "${lines[1]}" == 'foreign_key_check: sqlite3 failed:'* ]]
+}
+
 # --- second boot ------------------------------------------------------------------
 
 @test "second_boot_repairs: a repair that did work is flagged, one that found nothing is not" {
@@ -118,6 +132,24 @@ EOS
   echo '{"fields":{"message":"imported playlist/collection/version membership from Data JSON","rows":2850}}' >> second.log
   run adoption_second_boot_repairs second.log
   [[ "$output" == *"imported playlist/collection/version membership"* ]]
+}
+
+@test "second_boot_repairs: promotions are work even when repaired is zero" {
+  echo '{"fields": {"message": "repaired alternate-version primaries from LinkedChildren", "repaired": 0, "promoted": 1}}' > second.log
+  run adoption_second_boot_repairs second.log
+  [[ "$output" == *'repaired alternate-version primaries'* ]]
+}
+
+@test "second_boot_repairs: all-zero counters are ignored regardless of their order" {
+  echo '{"fields": {"promoted": 0, "message": "repaired alternate-version primaries from LinkedChildren", "repaired": 0}}' > second.log
+  run adoption_second_boot_repairs second.log
+  [ -z "$output" ]
+}
+
+@test "second_boot_repairs: a repair without counters is still reported" {
+  echo '{"fields":{"message":"repaired OwnerId relationships"}}' > second.log
+  run adoption_second_boot_repairs second.log
+  [[ "$output" == *'repaired OwnerId relationships'* ]]
 }
 
 # --- credentials ----------------------------------------------------------------------

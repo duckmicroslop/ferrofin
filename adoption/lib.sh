@@ -38,16 +38,33 @@ adoption_compare_smoke() {
 # exempt.
 adoption_check_db() {
   local db=$1 ic fk
-  ic=$(sqlite3 -readonly "file:$db?mode=ro" 'PRAGMA integrity_check' | grep -v 'missing from index IX_Peoples_NameLower' | head -1)
-  [ -z "$ic" ] || [ "$ic" = ok ] || echo "integrity_check: $ic"
-  fk=$(sqlite3 -readonly "file:$db?mode=ro" 'PRAGMA foreign_key_check' | wc -l)
-  [ "$fk" = 0 ] || echo "foreign_key_check: $fk rows"
+  # Capture sqlite3's status before filtering: a failed query must produce a
+  # reason on stdout, which run.sh collects into its failure list.
+  if ic=$(sqlite3 -readonly "file:$db?mode=ro" 'PRAGMA integrity_check' 2>&1); then
+    ic=$(printf '%s\n' "$ic" | grep -Ev '^(ok|row [0-9]+ missing from index IX_Peoples_NameLower)$' || true)
+    [ -z "$ic" ] || echo "integrity_check: $ic"
+  else
+    echo "integrity_check: sqlite3 failed: $ic"
+  fi
+  if fk=$(sqlite3 -readonly "file:$db?mode=ro" 'PRAGMA foreign_key_check' 2>&1); then
+    [ -z "$fk" ] || echo "foreign_key_check: $(printf '%s\n' "$fk" | wc -l) rows"
+  else
+    echo "foreign_key_check: sqlite3 failed: $fk"
+  fi
 }
 
 # adoption_second_boot_repairs <log-since-restart>: the first repair line a second boot logged,
-# or nothing. A repair that found nothing to do ("repaired":0) is not a repair.
+# or nothing. Ignore a repair only when all its numeric counters are zero;
+# alternate-version repairs can promote items even when "repaired" is zero.
+# A repair with no counters is conservatively reported.
 adoption_second_boot_repairs() {
-  grep -E "$ADOPTION_REPAIR_RE" "$1" | grep -v '"repaired":0' | head -1 | cut -c1-120
+  jq -Rr --arg re "$ADOPTION_REPAIR_RE" '
+    fromjson?
+    | select((.fields.message // "") | test($re))
+    | [.fields[] | select(type == "number")] as $counts
+    | select(($counts | length) == 0 or any($counts[]; . != 0))
+    | tojson
+  ' "$1" | head -1 | cut -c1-120
 }
 
 # adoption_smoke_credentials <jellyfin.db> [username]: "username token deviceid userid" for the
