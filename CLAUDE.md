@@ -133,8 +133,9 @@ Behavior that was a `virtual` method on `BaseItem` becomes a **free function ove
 macros** — they require a live `DATABASE_URL` at build/CI time, which we deliberately avoid.
 The schema is an ordered migration chain (`crates/ferrofin-db/migrations/`) whose
 Jellyfin-owned shape is **pinned byte-equal to a real Jellyfin 12.0 database** (`0032` converges the
-10.11.8 shape the chain carried through `0029`; the gate adopts the exact 10.11.8 and 12.0.0
-`__EFMigrationsHistory` sets) — that is
+10.11.8 shape the chain carried through `0029`; the gate adopts the exact
+`__EFMigrationsHistory` sets for 10.11.8–10.11.11, 12.0.0 and 12.1.0, including both
+12.1 upgrade routes in the [support matrix](adoption/README.md#supported-and-tested-versions)) — that is
 what makes drop-in adoption of an existing Jellyfin DB possible (point Ferrofin at it and it
 migrates in place). Ferrofin-own tables/indexes live in a collision-proof
 `Ferrofin*`/`FerrofinIX_*` namespace. The `schema_conformance` test guards the pin.
@@ -289,11 +290,14 @@ a query stays *off* a `CROSS JOIN`. `ANALYZE` is deliberately unused and `sqlite
 never exists.
 
 ### Adoption has its own live check — `adoption/`
-`adoption/run.sh --fixtures DIR --image ferrofin:bench` adopts a real 10.11.8, 10.11.11, 12.0
-and 12.1 database (fixtures you supply and build once with `adoption/build-fixtures.sh`; never
-committed) on fresh copies and checks generation, migrations, Jellyfin 12.1's own smoke answers,
-file integrity and a repair-free second boot. Run it for any change to the migration chain,
-the adoption gate or the boot repairs — see `adoption/README.md`.
+`adoption/run.sh --fixtures DIR --image ferrofin:bench` covers real 10.11.8, 10.11.9,
+10.11.10, 10.11.11, 12.0.0 and 12.1.0 databases, with separate 12.1 fixtures upgraded from
+10.11.8 and 12.0.0. Supply fixtures and build them once with `adoption/build-fixtures.sh`;
+they are never committed. On fresh copies it checks generation, migrations, Jellyfin 12.1's
+normalised smoke summaries, file integrity and a repair-free second boot. All seven paths
+passed on 2026-09-16; the [test record](adoption/README.md#supported-and-tested-versions)
+identifies the image used. Run it for any change to the migration chain, the adoption gate
+or the boot repairs. The shell tests in CI exercise the harness without these live fixtures.
 
 ### Green tests are necessary, not sufficient
 Several real bugs in this codebase passed their unit/integration tests and were caught only

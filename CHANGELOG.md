@@ -25,8 +25,12 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 
 ### Tooling
 - `adoption/`: an adoption smoke harness that runs every supported Jellyfin generation
-  (10.11.8, 10.11.11, 12.0, 12.1) through an image on fresh fixture copies and diffs the
+  (10.11.8, 10.11.9, 10.11.10, 10.11.11, 12.0.0, 12.1.0) through an image on fresh fixture copies and diffs the
   answers against Jellyfin 12.1's own; fixtures are derived from one supplied 10.11.8 snapshot
+- All seven live fixture paths passed on 2026-09-16, including both 12.1 upgrade routes;
+  see the [support matrix and tested build](adoption/README.md#supported-and-tested-versions).
+  The harness now reports SQLite query failures and detects version promotions when the
+  repaired count is zero, with five regression tests; all 36 shell tests passed.
 
 ### Parity
 - Port Jellyfin 12.0's data routines: linked-children move, orphaned extras, OwnerId
@@ -1661,5 +1665,4 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 ### Style
 - Rustfmt the person_ids filmography test
 - Rustfmt the extensions registered_plugins builder
-
 

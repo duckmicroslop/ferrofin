@@ -33,7 +33,9 @@ Behaviour that changed with the shape:
   display preferences moved along.
 - **Adopting a Jellyfin database** now accepts 12.0.0 and 12.1.0 as well as 10.11.8–10.11.11
   (exact migration sets, still one-way; a 12.x database baselines `0030` and `0032`, whose
-  shape it already has).
+  shape it already has). All six releases passed live adoption tests on 2026-09-16,
+  including both 10.11.8 → 12.1.0 and 10.11.8 → 12.0.0 → 12.1.0. See the
+  [support matrix and tested build](../adoption/README.md#supported-and-tested-versions).
 - A **Playlists** (or Collections) view is listed only when the user can see something in it,
   as in Jellyfin 12.1. A library whose playlists all live inside music album folders — every
   `.m3u` next to an album — has no Playlists view on the home screen; the playlists themselves
